@@ -5,7 +5,7 @@
 ![Python](https://img.shields.io/badge/Python-3.8+-3776AB?style=flat-square&logo=python&logoColor=white)
 ![PyTorch](https://img.shields.io/badge/PyTorch-EE4C2C?style=flat-square&logo=pytorch&logoColor=white)
 ![License](https://img.shields.io/badge/License-MIT-green?style=flat-square&logo=opensourceinitiative&logoColor=white)
-![Status](https://img.shields.io/badge/Status-Experimental-orange?style=flat-square&logo=experiment&logoColor=white)
+![Status](https://img.shields.io/badge/Status-Alpha_Experimental-red?style=flat-square&logo=warning&logoColor=white)
 
 [![Website](https://img.shields.io/badge/Website-xctopus.com-00A98F?style=flat-square&logo=internet-explorer&logoColor=white)](https://xctopus.com)
 [![Documentation](https://img.shields.io/badge/Docs-Available-blue?style=flat-square&logo=readthedocs&logoColor=white)](#-links-and-resources)
@@ -50,7 +50,7 @@ Xctopus is, for now, an evolving research prototype.
 
 ### Project Status
 
-Xctopus is currently an evolving research prototype—experimental, under active development, and open to collaboration.
+⚠️ **Alpha / Experimental** — Xctopus is currently an evolving research prototype. The framework is experimental, under active development, and APIs may change. Use with caution in production environments. Contributions and feedback are welcome as the system continues to grow.
 
 ---
 
@@ -364,7 +364,8 @@ pipeline = XctopusPipeline('data.csv')
 pipeline.run(step='my_custom')
 ```
 
-### Legacy API Examples
+<details>
+<summary><strong>Legacy API Examples</strong> - Basic node usage, text preprocessing, cluster analysis, and fine-tuning</summary>
 
 #### Basic Node Usage
 
@@ -482,6 +483,8 @@ for cluster_id, cluster_size, node in large_clusters:
     print(f"Cluster {cluster_id}: Improvement = {results['improvement']:.6f}")
 ```
 
+</details>
+
 ### Command Line Interface (CLI)
 
 The recommended way to run Xctopus from the command line:
@@ -518,7 +521,8 @@ xctopus-run data/dataset.csv --no-auto-detect --text-columns title
 xctopus-run data/dataset.csv --verbose
 ```
 
-### Cluster Utility Functions
+<details>
+<summary><strong>Cluster Utility Functions</strong> - Advanced cluster analysis, merging, and quality evaluation</summary>
 
 ```python
 from xctopus.nodes.bayesian.utils import (
@@ -559,7 +563,10 @@ print(f"Silhouette: {metrics['silhouette_score']}")
 print(f"Davies-Bouldin: {metrics['davies_bouldin_score']}")
 ```
 
-### LoRA Auditing and Advanced Evaluation
+</details>
+
+<details>
+<summary><strong>LoRA Auditing and Advanced Evaluation</strong> - Monitor LoRA parameter changes and evaluate learning performance</summary>
 
 ```python
 from xctopus.nodes.bayesian.utils import LoRAAuditor, LearningEvaluator
@@ -609,6 +616,8 @@ report = evaluator.generate_learning_report(
     train_epochs=5
 )
 ```
+
+</details>
 
 ---
 
