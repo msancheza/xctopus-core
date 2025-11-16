@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+
+# Environments
+env/
+venv/
+.venv/
+docs/
+examples/
+scripts/deprecated/
+datasets/
+# Jupyter
+.ipynb_checkpoints/
+
+# Secrets / Config
+*.env
+config.local.yaml
+
+# Data (raw or large)
+data/**/*.csv
+data/**/*.json
+data/**/*.txt
+data/**/*.pt
+data/**/*.ckpt
+data/**/*.bin
+
+# Models
+models/
+*.pt
+*.ckpt
+*.safetensors
+
+# Logs
+logs/
+*.log
