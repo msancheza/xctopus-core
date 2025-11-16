@@ -11,9 +11,10 @@ env/
 venv/
 .venv/
 docs/
-examples/
 scripts/deprecated/
 datasets/
+examples/
+tests/
 # Jupyter
 .ipynb_checkpoints/
 
