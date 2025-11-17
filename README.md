@@ -280,6 +280,7 @@ from xctopus.nodes.bayesian.utils import (
 - 📚 **Documentation**: See `docs/` folder for detailed guides
 - 📊 **Demonstration notebooks**: See `notebooks/` folder
   - `xctopus_training_evaluation.ipynb` - Interactive notebook for training and evaluation with parameter tuning
+- 💬 **Research Discussion**: [Approaches to Mitigate Catastrophic Forgetting in Modular Systems](https://discuss.huggingface.co/t/approaches-to-mitigate-catastrophic-forgetting-in-modular-systems/170536) - Hugging Face discussion on modular learning architectures
 
 ---
 
