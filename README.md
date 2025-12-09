@@ -9,10 +9,13 @@
 
 [![Website](https://img.shields.io/badge/Website-xctopus.com-00A98F?style=flat-square&logo=internet-explorer&logoColor=white)](https://xctopus.com)
 [![Documentation](https://img.shields.io/badge/Docs-Available-blue?style=flat-square&logo=readthedocs&logoColor=white)](#-links-and-resources)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.17862644.svg)](https://doi.org/10.5281/zenodo.17862644)
 
 </div>
 
-**Xctopus** is an experimental framework for Distributed Epistemic Memory, designed as a hierarchical continual-learning system built from Transformers, Bayesian Nodes, and modular knowledge orchestration. It explores how adaptive, progressive, and traceable learning can emerge from interacting knowledge units, enabling research into flexible architectures that evolve over time. Contributions are welcome as the system continues to grow.
+**Xctopus** is an experimental framework designed for Catastrophic Forgetting Mitigation via Distributed Epistemic Memory. It is a hierarchical continual-learning system built from Transformers, Bayesian Nodes, and modular knowledge orchestration.
+
+It explores how adaptive, progressive, and traceable learning can emerge from interacting knowledge units, enabling research into flexible architectures that evolve over time. Contributions are welcome as the system continues its active development.
 
 ### Technology Stack
 
@@ -43,14 +46,15 @@
 
 ### Project Objective
 
-Develop an architecture where multiple Knowledge Nodes collaborate to process information, update Bayesian beliefs, and enable cumulative learning while preserving previously acquired knowledge.
+Our primary objective is the Mitigation of Catastrophic Forgetting in continual learning systems. We develop an architecture where multiple Knowledge Nodes collaborate to process information, update Bayesian beliefs, and enable cumulative learning while preserving previously acquired knowledge.
+
 The goal is to explore how modular, hierarchical, and epistemically-grounded components can support flexible, scalable, and traceable continuous learning.
 
 Xctopus is, for now, an evolving research prototype.
 
 ### Project Status
 
-⚠️ **Alpha / Experimental** — Xctopus is currently an evolving research prototype. The framework is experimental, under active development, and APIs may change. Use with caution in production environments. Contributions and feedback are welcome as the system continues to grow.
+⚠️ **Alpha / Experimental** — Xctopus is currently an evolving research prototype. The framework is experimental, under active development. Use with caution in production environments. Contributions and feedback are welcome as the system continues to grow.
 
 ---
 
@@ -68,28 +72,31 @@ Each Knowledge Node encapsulates a self-contained computational unit composed of
 * A Bayesian update/filtering mechanism
 * A feedback loop for internal state refinement
 * Inheritable hyperparameters passed from upper-level controllers
+* **Knowledge Node Repository** integration for metadata tracking (coherence, size, centroids, creation epoch, merge history)
 
-This structure enables progressive specialization while maintaining architectural coherence across the hierarchy.
+The Knowledge Node Repository provides write-through pattern synchronization, enabling immediate consistency between the active filter state and persistent metadata storage. This structure enables progressive specialization while maintaining architectural coherence across the hierarchy and full traceability of node lifecycle.
 
 ### **2. Modular Orchestration**
-
 
 Nodes interact through a lightweight orchestration layer capable of:
 
 * Sharing signals and intermediate representations
 * Assigning domain-specific processing roles
 * Routing outputs toward upper filters for integration and global reasoning
-* The orchestration design promotes scalability and domain-modular learning.
+* **Blueprint Integration** - The system requires a pre-training Blueprint phase (Semantic Map) that materializes initial Knowledge Nodes and creates a `dataset_to_kn_map` for efficient embedding-to-node routing
+* **Optimized Processing** - Embeddings are reorganized by Knowledge Node during training, enabling batch processing and reducing computational overhead
+
+The orchestration design promotes scalability and domain-modular learning, with the Blueprint serving as the foundational structure that guides the continuous learning process.
 
 
 ### **3. Continuous Learning**
 
-Xctopus incorporates principles from *Bayesian Continual Learning* to support:
+Xctopus incorporates advanced principles from *Bayesian Continual Learning* to ensure robust knowledge retention and prevent catastrophic forgetting.
 
-* Belief updating over time
-* Dynamic prior adjustment
-* Preservation and evolution of internal state histories
-* Structured logging for traceability and interpretability
+* **Bayesian Belief Updating** - Filters continuously update node beliefs over time for adaptive knowledge acquisition
+* **Adaptive Priors & State Preservation** - Prior distributions dynamically adjust, coupled with full lifecycle tracking for traceable internal state histories
+* **Dynamic Memory Orchestration** - Implements automatic archiving, micro-cluster fusion, and intelligent memory bounds management to optimize coherence and memory usage
+* **Traceability and Debugging** - Centralized logging and advanced analytical tools (including Voronoi analysis) are integrated for deep interpretability and boundary understanding
 
 ---
 
