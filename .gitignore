@@ -46,3 +46,6 @@ logs/
 *.sqlite
 *.sqlite3
 knowledge_base.sqlite
+
+# Repository data (legacy/generated - NOT needed for GitHub)
+repository_data/
