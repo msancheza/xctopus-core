@@ -1,4 +1,0 @@
-"""
-Xctopus Scripts Module
-"""
-

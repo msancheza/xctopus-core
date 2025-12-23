@@ -1,4 +1,0 @@
-"""
-CLI Scripts for XctopusPipeline
-"""
-

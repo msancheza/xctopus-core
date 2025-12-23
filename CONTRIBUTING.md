@@ -204,6 +204,7 @@ If you have questions about how to contribute:
 
 - Open a [Discussion](https://github.com/msancheza/xctopus-core/discussions)
 - Review the [documentation](https://xctopus.com)
+- Check the [Architecture Overview](../docs/diagrams/contributor_architecture_overview.md) for a high-level system view
 - Contact the maintainers
 
 ## Recognition

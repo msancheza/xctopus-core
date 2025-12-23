@@ -11,6 +11,8 @@ env/
 venv/
 .venv/
 docs/
+notebooks_build/
+scripts/
 scripts/deprecated/
 datasets/
 examples/
@@ -39,3 +41,8 @@ models/
 # Logs
 logs/
 *.log
+
+# Database
+*.sqlite
+*.sqlite3
+knowledge_base.sqlite

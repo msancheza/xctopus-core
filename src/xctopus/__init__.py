@@ -1,40 +1,28 @@
 """
-Xctopus - Hierarchical Continuous Learning Framework
+Xctopus - Capa Clustering
 
-This package provides a modular architecture for continuous learning
-using Transformers and Bayesian Nodes.
-
-Quick Start:
-    from xctopus import XctopusPipeline
-    
-    pipeline = XctopusPipeline('data.csv')
-    pipeline.run()
-
-Or use the CLI:
-    xctopus-run data.csv
+Sistema de organización orgánica de conocimiento mediante Knowledge Nodes.
 """
 
-# Pipeline API (new, recommended)
-try:
-    from .pipeline import XctopusPipeline, PipelineConfig
-    _HAS_PIPELINE = True
-except ImportError:
-    _HAS_PIPELINE = False
+__version__ = "0.1.0"
 
-# Backward compatibility: existing exports
-try:
-    from .nodes.bayesian.bayesian_node import BayesianNode
-    from .nodes.bayesian.bayesian_filter import BayesianFilter
-    from .nodes.transformer.transformer import TransformerNode
-    _HAS_NODES = True
-except ImportError:
-    _HAS_NODES = False
+# Inicializar logging al importar el paquete
+from .logger_config import setup_logging
 
-# Build __all__ based on what's available
-__all__ = []
+# Configurar logging automáticamente
+setup_logging()
 
-if _HAS_PIPELINE:
-    __all__.extend(['XctopusPipeline', 'PipelineConfig'])
+# Exports principales
+from .repository import KNRepository
+from .filter_bayesian import FilterBayesian
+from .knowledgenode import KnowledgeNode
+from .orchestrator import Orchestrator
 
-if _HAS_NODES:
-    __all__.extend(['BayesianNode', 'BayesianFilter', 'TransformerNode'])
+__all__ = [
+    "setup_logging",
+    "KNRepository",
+    "FilterBayesian",
+    "KnowledgeNode",
+    "Orchestrator",
+    # Se completará en fases siguientes
+]
