@@ -9,7 +9,7 @@
 
 [![Website](https://img.shields.io/badge/Website-xctopus.com-00A98F?style=flat-square&logo=internet-explorer&logoColor=white)](https://xctopus.com)
 [![Documentation](https://img.shields.io/badge/Docs-Available-blue?style=flat-square&logo=readthedocs&logoColor=white)](#-documentation)
-[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.17862644.svg)](https://doi.org/10.5281/zenodo.17862644)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.17862644.svg)](https://doi.org/10.5281/zenodo.18028968)
 
 </div>
 
