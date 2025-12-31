@@ -75,7 +75,7 @@ The system demonstrates **automatic adaptation** - detecting domain characterist
 
 ![Xctopus Adaptive Knowledge Architecture](assets/architecture.jpg)
 
-Xctopus is built on an Adaptive Knowledge Architecture by Layers, where each layer acts as a specialized component that evolves based on domain characteristics. Currently, Layer 1 (Clustering & Fusion) is fully implemented, optimized, and empirically validated.
+Xctopus is built on an Adaptive Knowledge Architecture by Layers, where each layer acts as a specialized component that evolves based on domain characteristics. Layer 1 (Clustering) and Layer 2/3 (Reactive Orchestration) are now implemented.
 
 ### Core Principles
 
@@ -108,6 +108,12 @@ Data that doesn't fit anywhere isn't lost. It goes to a Temporary Buffer. When e
 
 ### 4. **Evolutionary Stability**
 Nodes update their "memory" (centroid and variance) using Welford's Algorithm. This allows the system to learn incrementally without ever needing to re-train from scratch.
+
+### 5. **Reactive Feedback Loop (Layer 2 & 3)**
+The Orchestrator coordinates a reactive cycle:
+- **Act**: The Node (Transformer) generates separate output using its specific LoRA adapter.
+- **Judge**: A PostProcessor evaluates confidence.
+- **Learn**: If high confidence, the Node is reinforced (Mass+, Variance-). If low, a new Buffer is created.
 
 **Visualization**: The system maps knowledge as a galaxy of nodes where size reflects accumulated semantic mass. See the "Visual Evidence" section below for detailed visualization of the "Archipelago" structure in scientific domains.
 
@@ -150,18 +156,26 @@ Nodes update their "memory" (centroid and variance) using Welford's Algorithm. T
 - Transformer/LoRA components (standby for future layers)
 
 #### 4. **Orchestrator** (`orchestrator.py`)
-- Coordinates routing decisions and node lifecycle
-- Intelligent refresh of FilterBayesian signatures (every `REFRESH_INTERVAL`)
-- Buffer aggregation (groups similar buffers before creating new ones)
-- Warmup: loads existing nodes from Repository on startup
+- **Reactive Brain**: Coordinates the entire Route -> Act -> Judge -> Learn cycle.
+- **Layer 2/3 Integration**: Dynamically loads LoRA weights and delegates to TransformerBase.
+- **Intelligent Refresh**: Updates FilterBayesian signatures only when needed.
+- **Warmup**: Loads existing nodes from Repository on startup.
 
-#### 5. **Main** (`main.py`)
+#### 5. **TransformerBase** (`transformer_base.py`)
+- **Layer 3 Engine**: Singleton wrapper for the base model (VRAM efficient).
+- **Dynamic LoRA**: Safely injects and unloads node-specific adapters (`apply_lora`) to prevent knowledge leakage.
+
+#### 6. **PostProcessor** (`post_processing.py`)
+- **Layer 3 Judge**: Evaluates model execution confidence.
+- **Feedback Loop**: Returns `Feedback` objects (Delta Mass/Variance) to reinforce or penalize nodes.
+
+#### 7. **Main** (`main.py`)
 - Entry point for processing datasets
 - Optimized processing loop (warmup + intelligent refresh)
 - Rich console output with progress bars and formatted tables
 - Batch commits for efficient database operations
 
-#### 6. **Fusion Engine** (`fusion.py`)
+#### 8. **Fusion Engine** (`fusion.py`)
 - Post-clustering fusion protocol for consolidating similar Knowledge Nodes
 - Vectorized similarity matrix calculations (optimized for large-scale analysis)
 - Semantic adjacency matrix computation
@@ -196,6 +210,8 @@ xctopus/
 │       ├── filter_bayesian.py       # FilterBayesian: Routing logic
 │       ├── knowledgenode.py         # KnowledgeNode: Core node logic
 │       ├── orchestrator.py          # Orchestrator: Coordination layer
+│       ├── transformer_base.py      # TransformerBase: Singleton & LoRA injection
+│       ├── post_processing.py       # PostProcessor: Confidence & Feedback
 │       └── fusion.py                # Fusion Engine: Post-clustering consolidation
 ├── notebooks/                       # Jupyter notebooks for testing and analysis
 │   └── quickstart.ipynb             # Main testing notebook
@@ -364,16 +380,18 @@ REFRESH_INTERVAL = 20
 
 Xctopus follows a **layered architecture approach**, where each layer builds upon the previous one:
 
-### ✅ Layer 1: Clustering & Fusion (COMPLETED - December 2025)
+### ✅ Layer 1: Clustering & Fusion (COMPLETED)
+**Status**: Fully implemented, optimized, and empirically validated.
 
-**Status**: Fully implemented, optimized, and empirically validated
+### ✅ Layer 2 & 3: Reactive Architecture (COMPLETED - Dec 2025)
+**Status**: Core reactive flow and component integration complete.
 
-- ✅ **Core Components**: Repository, FilterBayesian, KnowledgeNode, Orchestrator
-- ✅ **Fusion Engine**: Post-clustering consolidation of similar Knowledge Nodes
-- ✅ **Vectorized Diagnostics**: Optimized similarity calculations for large-scale analysis
-- ✅ **Universal Validation**: System validated on conversational and scientific domains
-- ✅ **Adaptive Granularity**: Automatic adjustment of clustering density based on domain
-- ✅ **Performance Optimizations**: Vectorized operations, intelligent refresh, batch commits
+- ✅ **Reactive Orchestrator**: Implements Route -> Act -> Judge -> Learn flow.
+- ✅ **TransformerBase**: Singleton architecture with safe LoRA injection.
+- ✅ **PostProcessor**: Confidence-based feedback mechanism.
+- ✅ **Repository**: LoRA storage/retrieval with LRU caching.
+
+### 🔄 Layer 2: Fine-tuning & Persistence (IN PROGRESS)
 
 **Validation Results**:
 - Processes 18,260 embeddings in ~15-16 minutes
