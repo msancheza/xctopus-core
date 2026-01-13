@@ -38,16 +38,17 @@ The system is built from Transformers, Bayesian Nodes, and modular knowledge orc
 - [Architecture Overview](#architecture-overview)
 - [How it Works](#how-it-works)
 - [Key Components](#key-components)
-- [Empirical Validation](#empirical-validation)
-- [Performance Optimizations](#performance-optimizations)
 - [Project Structure](#project-structure)
 - [Installation](#installation)
 - [Quick Start](#quick-start)
 - [Configuration](#configuration)
-- [Documentation](#documentation)
 - [Roadmap](#roadmap)
+- [Performance Optimizations](#performance-optimizations)
+- [Empirical Validation](#empirical-validation)
 - [Contributions](#contributions)
 - [License](#license)
+- [Links and Resources](#links-and-resources)
+- [Final Note](#final-note)
 
 ---
 
@@ -73,7 +74,7 @@ The system demonstrates **automatic adaptation** - detecting domain characterist
 
 ## Architecture Overview
 
-![Xctopus Adaptive Knowledge Architecture](assets/architecture.jpg)
+![Xctopus Adaptive Knowledge Architecture](assets/architecture.png)
 
 Xctopus is built on an Adaptive Knowledge Architecture, where specialized components evolve based on domain characteristics. The system includes clustering, fusion, reactive orchestration with LoRA inference, and continuous training infrastructure.
 
