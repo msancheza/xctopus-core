@@ -54,21 +54,25 @@ The system is built from Transformers, Bayesian Nodes, and modular knowledge orc
 
 ## Project Objective
 
-Our primary mission is the **Mitigation of Catastrophic Forgetting** in continual learning systems. Xctopus achieves this by evolving from a rigid model into an **Adaptive Knowledge Architecture**.
+Our mission is to solve **Catastrophic Forgetting** in continual learning environments. Xctopus achieves this by replacing rigid model structures with an **Adaptive Knowledge Architecture** that scales with data complexity.
 
 ### Key Focus Areas
 
-**Organic Adaptation**: The system acts as a "living organism" that adjusts its granularity based on domain complexity (e.g., automatically shifting from "Continents" in conversational data to "Archipelagos" in scientific data).
+**Organic Adaptation**: The system autonomously adjusts its granularity—shifting from broad categories to dense "archipelagos" of expertise as domain complexity increases.
 
-**Epistemic Collaboration**: Multiple Knowledge Nodes collaborate to process information, update Bayesian beliefs, and enable cumulative learning while preserving previously acquired knowledge.
+**Epistemic Collaboration**: Knowledge Nodes (KNs) act as specialized agents that update Bayesian beliefs, enabling cumulative learning without degrading previously acquired weights.
 
-**Traceability**: Ensuring that every piece of acquired knowledge is persistent, scalable, and semantically pure.
-
-The system demonstrates **automatic adaptation** - detecting domain characteristics and adjusting clustering density without manual intervention, while maintaining semantic purity across diverse domains (validated on conversational and scientific domains with <1% variance difference).
+**Data Traceability**: 100% provenance tracking; every specialized weight (LoRA) is linked back to its original source data for full auditability and semantic purity.
 
 ### Project Status
 
-⚠️ **Alpha / Experimental** — Xctopus is an evolving research prototype. The system is fully operational with clustering, fusion, reactive orchestration with LoRA inference, and continuous training infrastructure. Automatic training triggers, asynchronous execution, and data provenance are implemented. Future enhancements are under active development. Use with caution in production environments. Contributions and feedback are welcome as the system continues to grow.
+⚠️ **Alpha / Experimental** — The core engine is fully operational, featuring:
+
+- **Reactive Orchestration**: Real-time routing and LoRA inference.
+- **Automated Training**: Asynchronous PEFT triggers and non-blocking knowledge induction.
+- **Stability**: Validated across diverse domains (Conversational & Scientific) with high semantic consistency (<1% variance).
+
+Contributions are welcome as we scale from prototype to a production-ready framework.
 
 ---
 
