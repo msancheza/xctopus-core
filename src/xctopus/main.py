@@ -1,8 +1,8 @@
 """
-Main para Capa Clustering.
+Main for Clustering Layer.
 
-Punto de entrada del sistema: carga dataset, inicializa componentes y procesa embeddings.
-Integra todas las fases anteriores en un flujo completo.
+System entry point: loads dataset, initializes components, and processes embeddings.
+Integrates all previous phases into a complete flow.
 """
 
 import torch
@@ -22,10 +22,18 @@ except ImportError:
     logging.warning("rich is not installed. Tables will be displayed in simple format.")
 
 try:
-    from tqdm import tqdm
-    TQDM_AVAILABLE = True
+    # Try tqdm.notebook first (better for Jupyter), fallback to regular tqdm
+    try:
+        from tqdm.notebook import tqdm
+        TQDM_AVAILABLE = True
+        TQDM_NOTEBOOK = True
+    except ImportError:
+        from tqdm import tqdm
+        TQDM_AVAILABLE = True
+        TQDM_NOTEBOOK = False
 except ImportError:
     TQDM_AVAILABLE = False
+    TQDM_NOTEBOOK = False
 
 from .repository import KNRepository
 from .filter_bayesian import FilterBayesian
@@ -48,24 +56,24 @@ def load_embeddings(dataset_path: str) -> List[torch.Tensor]:
     Load embeddings from dataset.
     
     Supports formats:
-    - CSV: archivo con embeddings separados por comas
-    - NPY: archivo numpy (.npy)
-    - NPZ: archivo numpy comprimido (.npz)
+    - CSV: file with comma-separated embeddings
+    - NPY: numpy file (.npy)
+    - NPZ: compressed numpy file (.npz)
     
     Args:
-        dataset_path: Ruta al archivo del dataset
+        dataset_path: Path to dataset file
     
     Returns:
-        Lista de tensores FP16 en DEVICE configurado
+        List of FP16 tensors on configured DEVICE
     
     Raises:
-        FileNotFoundError: Si el archivo no existe
-        ValueError: Si el formato no es soportado o embeddings son inválidos
+        FileNotFoundError: If file exists
+        ValueError: If format is unsupervised or embeddings are invalid
     """
     dataset_path = Path(dataset_path)
     
     if not dataset_path.exists():
-        raise FileNotFoundError(f"Dataset no encontrado: {dataset_path}")
+        raise FileNotFoundError(f"Dataset not found: {dataset_path}")
     
     logger.info(f"Loading embeddings from: {dataset_path}")
     
@@ -125,12 +133,24 @@ def load_embeddings(dataset_path: str) -> List[torch.Tensor]:
         raise
 
 
-def initialize_components() -> Tuple[KNRepository, FilterBayesian, Orchestrator]:
+def initialize_components(
+    dataset_paths: Optional[dict] = None
+) -> Tuple[KNRepository, FilterBayesian, Orchestrator]:
     """
     Initialize all system components.
     
     OPTIMIZED: Loads signatures once at startup (warmup).
     This avoids refreshing on each iteration of the main loop.
+    
+    Phase 2: Accepts dataset_paths for DataManager initialization.
+    
+    Args:
+        dataset_paths: Optional dictionary mapping dataset names to file paths
+            Example: {
+                'arxiv': '/path/to/arxiv_data.csv',
+                '20newsgroups': '/path/to/20newsgroups.csv'
+            }
+            If None, DataManager will be initialized but won't have datasets
     
     Returns:
         Tuple with (Repository, FilterBayesian, Orchestrator)
@@ -155,8 +175,12 @@ def initialize_components() -> Tuple[KNRepository, FilterBayesian, Orchestrator]
     logger.debug(f"FilterBayesian initialized with {len(signatures)} signatures (warmup)")
     
     # Create Orchestrator (with Repository and FilterBayesian as dependencies)
-    orchestrator = Orchestrator(repository, filter_bayesian)
+    # Phase 2: Pass dataset_paths for DataManager
+    orchestrator = Orchestrator(repository, filter_bayesian, dataset_paths=dataset_paths)
     logger.debug("Orchestrator initialized")
+    
+    if dataset_paths:
+        logger.debug(f"DataManager initialized with {len(dataset_paths)} dataset paths")
     
     logger.info("Components initialized correctly")
     
@@ -171,62 +195,73 @@ def process_dataset(
     progress_interval: int = 100,
 ) -> None:
     """
-    Procesa el dataset completo de embeddings.
+    Processes the complete dataset of embeddings.
     
-    Flujo para cada embedding:
-    1. Ruteo: FilterBayesian decide ruteo (usa firmas en memoria)
-    2. Ejecución: Orchestrator ejecuta decisión
-       - Refrescos inteligentes cada REFRESH_INTERVAL
-    3. Batch commits: Commit periódico
+    Flow for each embedding:
+    1. Routing: FilterBayesian decides route (uses in-memory signatures)
+    2. Execution: Orchestrator executes decision
+       - Intelligent refreshes every REFRESH_INTERVAL
+    3. Batch commits: Periodic commit
     
-    OPTIMIZADO: Las firmas se cargan una vez al inicio (warmup).
-    El Orchestrator maneja refrescos inteligentes, evitando 18,233 consultas SQL.
+    OPTIMIZED: Signatures are loaded once at startup (warmup).
+    Orchestrator handles intelligent refreshes, avoiding 18,233 SQL queries.
     
     Args:
-        embeddings: Lista de embeddings a procesar
-        repository: Instancia de KNRepository
-        filter_bayesian: Instancia de FilterBayesian
-        orchestrator: Instancia de Orchestrator
-        progress_interval: Cada cuántos embeddings mostrar progreso (default: 100)
+        embeddings: List of embeddings to process
+        repository: KNRepository instance
+        filter_bayesian: FilterBayesian instance
+        orchestrator: Orchestrator instance
+        progress_interval: How many embeddings to show progress (default: 100)
     """
     total_embeddings = len(embeddings)
-    logger.info(f"Iniciando procesamiento de {total_embeddings} embeddings")
+    logger.info(f"Starting processing of {total_embeddings} embeddings")
     
-    # Detectar si estamos en un notebook
+    # Detect if we are in a notebook
     in_notebook = 'ipykernel' in sys.modules or 'IPython' in sys.modules
     
-    # Elegir método de progreso según el entorno
+    # Choose progress method based on environment
     if in_notebook and TQDM_AVAILABLE:
-        # En notebooks: usar tqdm (compatible con Jupyter, no duplica)
-        embeddings_iter = tqdm(
-            enumerate(embeddings),
-            total=total_embeddings,
-            desc="Procesando embeddings",
-            unit="embedding",
-            ncols=100  # Ancho fijo para mejor visualización en notebooks
-        )
+        # In notebooks: use tqdm (compatible with Jupyter, no duplication)
+        # Use file=sys.stdout to avoid stderr capture by logger
+        tqdm_kwargs = {
+            "total": total_embeddings,
+            "desc": "Processing embeddings",
+            "unit": "embedding",
+            "mininterval": 0.5,  # Update at most every 0.5 seconds to reduce spam
+            "maxinterval": 1.0   # Force update every 1 second max
+        }
+        # For tqdm.notebook, don't set ncols (auto-adjusts to notebook width)
+        # For regular tqdm, use None to auto-adjust or a reasonable width
+        if not TQDM_NOTEBOOK:
+            tqdm_kwargs["file"] = sys.stdout
+            tqdm_kwargs["ncols"] = None  # Auto-adjust width
+        else:
+            # tqdm.notebook handles width automatically
+            tqdm_kwargs["ncols"] = None
+        
+        embeddings_iter = tqdm(enumerate(embeddings), **tqdm_kwargs)
         
         for i, embedding in embeddings_iter:
             _process_single_embedding(
                 embedding, repository, filter_bayesian, orchestrator, i
             )
             
-            # Actualizar postfix con contadores de KNs y Buffers
+            # Update postfix with KN and Buffer counts
             counts = orchestrator.get_counts()
             embeddings_iter.set_postfix({
                 "KNs": counts["kn_count"],
                 "Buffers": counts["buffer_count"]
             })
             
-            # Logging periódico
+            # Periodic logging (DEBUG level to avoid console spam)
             if (i + 1) % progress_interval == 0:
-                logger.info(
-                    f"Procesados {i + 1}/{total_embeddings} embeddings "
+                logger.debug(
+                    f"Processed {i + 1}/{total_embeddings} embeddings "
                     f"({(i + 1) / total_embeddings * 100:.1f}%) | "
                     f"KNs: {counts['kn_count']}, Buffers: {counts['buffer_count']}"
                 )
     elif RICH_AVAILABLE and console and not in_notebook:
-        # Fuera de notebooks: usar rich Progress (más elegante)
+        # Outside notebooks: use rich Progress (more elegant)
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
@@ -236,7 +271,7 @@ def process_dataset(
             console=console,
         ) as progress:
             task = progress.add_task(
-                f"[cyan]Procesando embeddings...",
+                f"[cyan]Processing embeddings...",
                 total=total_embeddings
             )
             
@@ -245,38 +280,38 @@ def process_dataset(
                     embedding, repository, filter_bayesian, orchestrator, i
                 )
                 
-                # Actualizar progreso con información de KNs y Buffers
+                # Update progress with KN and Buffer info
                 counts = orchestrator.get_counts()
                 progress.update(
                     task,
                     advance=1,
-                    description=f"[cyan]Procesando embeddings... [dim]KNs: {counts['kn_count']}, Buffers: {counts['buffer_count']}[/dim]"
+                    description=f"[cyan]Processing embeddings... [dim]KNs: {counts['kn_count']}, Buffers: {counts['buffer_count']}[/dim]"
                 )
                 
-                # Logging periódico
+                # Periodic logging (DEBUG level to avoid console spam)
                 if (i + 1) % progress_interval == 0:
-                    logger.info(
-                        f"Procesados {i + 1}/{total_embeddings} embeddings "
+                    logger.debug(
+                        f"Processed {i + 1}/{total_embeddings} embeddings "
                         f"({(i + 1) / total_embeddings * 100:.1f}%) | "
                         f"KNs: {counts['kn_count']}, Buffers: {counts['buffer_count']}"
                     )
     else:
-        # Fallback: usar logging simple
+        # Fallback: use simple logging
         for i, embedding in enumerate(embeddings):
             _process_single_embedding(
                 embedding, repository, filter_bayesian, orchestrator, i
             )
             
-            # Logging periódico con contadores
+            # Periodic logging with counts (DEBUG level to avoid console spam)
             if (i + 1) % progress_interval == 0:
                 counts = orchestrator.get_counts()
-                logger.info(
-                    f"Procesados {i + 1}/{total_embeddings} embeddings "
+                logger.debug(
+                    f"Processed {i + 1}/{total_embeddings} embeddings "
                     f"({(i + 1) / total_embeddings * 100:.1f}%) | "
                     f"KNs: {counts['kn_count']}, Buffers: {counts['buffer_count']}"
                 )
     
-    logger.info(f"Procesamiento completado: {total_embeddings} embeddings procesados")
+    logger.info(f"Processing completed: {total_embeddings} embeddings processed")
 
 
 def _process_single_embedding(
@@ -285,6 +320,7 @@ def _process_single_embedding(
     filter_bayesian: FilterBayesian,
     orchestrator: Orchestrator,
     index: int,
+    source_id: Optional[str] = None,
 ) -> None:
     """
     Process a single embedding.
@@ -294,35 +330,40 @@ def _process_single_embedding(
     - Orchestrator handles intelligent refreshes (every REFRESH_INTERVAL)
     - This avoids 18,233 unnecessary SQL queries
     
+    Phase 2: Accepts source_id for data provenance (pointer to original dataset).
+    
     Args:
         embedding: Embedding tensor
         repository: KNRepository instance
         filter_bayesian: FilterBayesian instance
         orchestrator: Orchestrator instance
-        index: Embedding index (for batch commits)
+        index: Embedding index (for batch commits and source_id generation)
+        source_id: Optional source ID (pointer to original dataset)
+            If None, uses str(index) as source_id
     """
-    # ========================================================================
-    # Routing: FilterBayesian decides routing (uses signatures in memory)
-    # ========================================================================
-    # Note: Signatures are loaded once in initialize_components() (warmup)
-    # and are automatically refreshed by Orchestrator when REFRESH_INTERVAL is reached.
-    # This allows 99% of iterations to occur in GPU/RAM without touching disk.
-    decision = filter_bayesian.route(embedding)
-    
-    # ========================================================================
-    # Execution: Orchestrator executes decision
-    # ========================================================================
-    # Orchestrator handles:
-    # - Intelligent refreshes (every REFRESH_INTERVAL embeddings)
-    # - Similar buffer grouping
-    # - Signature updates in Repository
-    orchestrator.process_decision(decision, embedding)
-    
-    # ========================================================================
-    # Batch Commits: Periodic commit (handled internally by Repository)
-    # ========================================================================
-    # Repository handles batch commits internally with _maybe_commit()
-    # We don't need to manually commit here
+    try:
+        # ========================================================================
+        # Phase 2: Generate source_id if not provided
+        # ========================================================================
+        # Use index as source_id for data provenance
+        # This allows DataManager to retrieve original texts for training
+        actual_source_id = source_id if source_id is not None else str(index)
+        
+        # ========================================================================
+        # Reactive Flow: Orchestrator handles Route -> Act -> Judge -> Learn
+        # ========================================================================
+        # Phase 2: Pass source_id for data provenance
+        # This replaces separate route() and process_decision() calls
+        orchestrator.process_embedding(embedding, source_id=actual_source_id)
+        
+        # ========================================================================
+        # Batch Commits: Periodic commit (handled internally by Repository)
+        # ========================================================================
+        # Repository handles batch commits internally with _maybe_commit()
+        # We don't need to manually commit here
+    except Exception as e:
+        logger.error(f"Error processing embedding at index {index}: {e}", exc_info=True)
+        # Continue processing next embedding instead of stopping entire process
 
 
 def finalize(
@@ -377,21 +418,21 @@ def _show_summary_rich(signatures: List[dict], active_nodes_count: int) -> None:
     stats_table.add_row("Total KnowledgeNodes", str(len(signatures)))
     stats_table.add_row("Nodos Activos", str(active_nodes_count))
     stats_table.add_row("Total Embeddings", str(total_mass))
-    stats_table.add_row("Masa Promedio", f"{avg_mass:.1f}")
-    stats_table.add_row("Varianza Promedio", f"{avg_variance:.4f}")
+    stats_table.add_row("Average Mass", f"{avg_mass:.1f}")
+    stats_table.add_row("Average Variance", f"{avg_variance:.4f}")
     
     console.print(stats_table)
     
     # Tabla de KnowledgeNodes (top 10 por masa)
     if signatures:
-        console.print("\n[bold cyan]🔝 Top 10 KnowledgeNodes por Masa[/bold cyan]\n")
+        console.print("\n[bold cyan]🔝 Top 10 KnowledgeNodes by Mass[/bold cyan]\n")
         
         kn_table = Table(show_header=True, header_style="bold magenta")
         kn_table.add_column("Node ID", style="cyan", width=40)
-        kn_table.add_column("Masa", style="green", justify="right")
-        kn_table.add_column("Varianza", style="yellow", justify="right")
+        kn_table.add_column("Mass", style="green", justify="right")
+        kn_table.add_column("Variance", style="yellow", justify="right")
         
-        # Ordenar por masa (descendente)
+        # Sort by mass (descending)
         sorted_signatures = sorted(signatures, key=lambda x: x["mass"], reverse=True)
         
         for sig in sorted_signatures[:10]:
@@ -408,14 +449,14 @@ def _show_summary_rich(signatures: List[dict], active_nodes_count: int) -> None:
 
 def _show_summary_simple(signatures: List[dict], active_nodes_count: int) -> None:
     """
-    Muestra resumen final en formato simple (sin rich).
+    Shows final summary in simple format (without rich).
     
     Args:
-        signatures: Lista de firmas de KnowledgeNodes
-        active_nodes_count: Cantidad de nodos activos
+        signatures: List of KnowledgeNode signatures
+        active_nodes_count: Number of active nodes
     """
     logger.info("=" * 60)
-    logger.info("RESUMEN DEL PROCESAMIENTO")
+    logger.info("PROCESSING SUMMARY")
     logger.info("=" * 60)
     
     total_mass = sum(sig["mass"] for sig in signatures)
@@ -423,18 +464,18 @@ def _show_summary_simple(signatures: List[dict], active_nodes_count: int) -> Non
     avg_variance = sum(sig["variance"] for sig in signatures) / len(signatures) if signatures else 0
     
     logger.info(f"Total KnowledgeNodes: {len(signatures)}")
-    logger.info(f"Nodos Activos: {active_nodes_count}")
+    logger.info(f"Active Nodes: {active_nodes_count}")
     logger.info(f"Total Embeddings: {total_mass}")
-    logger.info(f"Masa Promedio: {avg_mass:.1f}")
-    logger.info(f"Varianza Promedio: {avg_variance:.4f}")
+    logger.info(f"Average Mass: {avg_mass:.1f}")
+    logger.info(f"Average Variance: {avg_variance:.4f}")
     
     if signatures:
-        logger.info("\nTop 10 KnowledgeNodes por Masa:")
+        logger.info("\nTop 10 KnowledgeNodes by Mass:")
         sorted_signatures = sorted(signatures, key=lambda x: x["mass"], reverse=True)
         for i, sig in enumerate(sorted_signatures[:10], 1):
             logger.info(
                 f"  {i}. {sig['node_id'][:50]}: "
-                f"masa={sig['mass']}, varianza={sig['variance']:.4f}"
+                f"mass={sig['mass']}, variance={sig['variance']:.4f}"
             )
     
     logger.info("=" * 60)
@@ -442,16 +483,16 @@ def _show_summary_simple(signatures: List[dict], active_nodes_count: int) -> Non
 
 def main(dataset_path: str) -> None:
     """
-    Función principal: punto de entrada del sistema.
+    Main function: system entry point.
     
-    Flujo completo:
-    1. Cargar embeddings del dataset
-    2. Inicializar componentes
-    3. Procesar dataset
-    4. Finalizar y mostrar resumen
+    Complete flow:
+    1. Load embeddings from dataset
+    2. Initialize components
+    3. Process dataset
+    4. Finalize and show summary
     
     Args:
-        dataset_path: Ruta al archivo del dataset
+        dataset_path: Path to dataset file
     """
     try:
         logger.info("=" * 60)
@@ -468,33 +509,33 @@ def main(dataset_path: str) -> None:
         process_dataset(embeddings, repository, filter_bayesian, orchestrator)
         
         # 4. Fusionar Knowledge Nodes (post-clustering)
-        logger.info("Iniciando proceso de fusión de Knowledge Nodes...")
+        logger.info("Starting Knowledge Nodes fusion process...")
         fusion_stats = fuse_knowledge_nodes(repository, orchestrator)
         logger.info(
-            f"Fusión completada: {fusion_stats['fusions_performed']} fusiones realizadas, "
+            f"Fusion completed: {fusion_stats['fusions_performed']} fusions performed, "
             f"{fusion_stats['initial_kns']} -> {fusion_stats['final_kns']} KNs"
         )
         
-        # 5. Finalizar
+        # 5. Finalize
         finalize(repository, orchestrator)
         
-        logger.info("Proceso completado exitosamente")
+        logger.info("Process completed successfully")
         
     except Exception as e:
-        logger.error(f"Error en procesamiento: {e}", exc_info=True)
+        logger.error(f"Error in processing: {e}", exc_info=True)
         raise
 
 
 if __name__ == "__main__":
-    # Punto de entrada cuando se ejecuta como script
+    # Entry point when run as script
     if len(sys.argv) < 2:
-        # Usar sys.stderr.write para mensajes de error en consola
-        # (no usar print para cumplir Regla 2)
-        sys.stderr.write("Error: Se requiere ruta al dataset\n")
-        sys.stderr.write("Uso: python -m xctopus.main <dataset_path>\n")
-        sys.stderr.write("Ejemplo: python -m xctopus.main data/embeddings.csv\n")
-        logger.error("Uso: python -m xctopus.main <dataset_path>")
-        logger.error("Ejemplo: python -m xctopus.main data/embeddings.csv")
+        # Use sys.stderr.write for error messages in console
+        # (do not use print to comply with Rule 2)
+        sys.stderr.write("Error: Dataset path required\n")
+        sys.stderr.write("Usage: python -m xctopus.main <dataset_path>\n")
+        sys.stderr.write("Example: python -m xctopus.main data/embeddings.csv\n")
+        logger.error("Usage: python -m xctopus.main <dataset_path>")
+        logger.error("Example: python -m xctopus.main data/embeddings.csv")
         sys.exit(1)
     
     dataset_path = sys.argv[1]

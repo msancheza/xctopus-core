@@ -688,6 +688,13 @@ def _merge_two_kns(
     # Create new KnowledgeNode
     merged_node_id = f"kn_{uuid4()}"
     
+    # ========================================================================
+    # Create KnowledgeNode temporarily for processing embeddings (2025-12-27)
+    # ========================================================================
+    # We need to create the node directly first to process embeddings,
+    # then save to Repository, then reload using from_repository() to get
+    # PEFT metadata synchronized
+    # ========================================================================
     kn = KnowledgeNode(
         node_id=merged_node_id,
         initial_centroid=merged_centroid,
@@ -710,6 +717,28 @@ def _merge_two_kns(
         mass=signature["mass"],
         variance=signature["variance"],
     )
+    
+    # ========================================================================
+    # Load KnowledgeNode using from_repository() (2025-12-27)
+    # ========================================================================
+    # Changed from keeping the directly created KnowledgeNode to loading
+    # from Repository using from_repository(). This ensures consistency:
+    # - PEFT metadata is loaded correctly (even if None)
+    # - Training status is loaded correctly (even if None)
+    # - Node state matches Repository state exactly
+    # ========================================================================
+    try:
+        # Reload from Repository to ensure metadata is synchronized
+        kn_loaded = KnowledgeNode.from_repository(repository, merged_node_id)
+        kn = kn_loaded
+    except ValueError as e:
+        # This should never happen since we just saved the node
+        logger.error(
+            f"Failed to load merged node '{merged_node_id}' from Repository after saving: {e}. "
+            f"Using directly created node (metadata may be incomplete)."
+        )
+        # Fallback: use the directly created node (metadata may be incomplete)
+        pass
     
     # Move embeddings to new node (if they exist)
     if all_embeddings:

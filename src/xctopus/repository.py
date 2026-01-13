@@ -6,9 +6,14 @@ Stores FP16 tensors as BLOBs for efficiency.
 """
 
 import sqlite3
+import io
+import functools
+from collections import OrderedDict
 import numpy as np
 import torch
 import logging
+import hashlib
+import json
 from typing import List, Dict, Any, Optional, Tuple
 from pathlib import Path
 
@@ -24,6 +29,8 @@ logger = logging.getLogger(__name__)
 
 
 class KNRepository:
+    # LRU cache for LoRA weights (node_id -> state_dict)
+    _lora_cache = functools.lru_cache(maxsize=128)(lambda self, node_id: self._load_lora_weights(node_id))
     """
     Repository for Knowledge Nodes.
     
@@ -119,6 +126,66 @@ class KNRepository:
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_node_id ON nodes(node_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_node_memory_node_id ON node_memory(node_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_buffer_embeddings_buffer_id ON buffer_embeddings(buffer_id)')
+        
+        # ========================================================================
+        # PEFT/LoRA Weights Support (2025-12-27)
+        # ========================================================================
+        # Migration: Add PEFT columns if they don't exist (for existing databases)
+        # These columns are optional and can be NULL for Layer 1 nodes
+        try:
+            cursor.execute('ALTER TABLE nodes ADD COLUMN peft_weights BLOB')
+            cursor.execute('ALTER TABLE nodes ADD COLUMN peft_format TEXT')
+            cursor.execute('ALTER TABLE nodes ADD COLUMN peft_size INTEGER')
+            cursor.execute('ALTER TABLE nodes ADD COLUMN peft_checksum TEXT')
+            cursor.execute('ALTER TABLE nodes ADD COLUMN peft_config TEXT')
+            cursor.execute('ALTER TABLE nodes ADD COLUMN peft_trained_timestamp TIMESTAMP')
+            logger.debug("PEFT columns added to nodes table (migration 2025-12-27)")
+        except sqlite3.OperationalError:
+            # Columns already exist, not an error
+            pass
+        
+        # ========================================================================
+        # PEFT Training Status Support (2025-12-27)
+        # ========================================================================
+        # Migration: Add training status column for Layer 2
+        # Values: 'TRAINING', 'COMPLETED', 'FAILED', or NULL (not training)
+        # Purpose: Allow Layer 2 to know if a node is currently being trained
+        # This enables intelligent fallback decisions (use Transformer base vs wait)
+        try:
+            cursor.execute('ALTER TABLE nodes ADD COLUMN peft_training_status TEXT')
+            logger.debug("peft_training_status column added (migration 2025-12-27)")
+        except sqlite3.OperationalError:
+            # Column already exists, not an error
+            pass
+        
+        # ========================================================================
+        # Phase 2: Training Support - Pointers and Training Status (2025-01-XX)
+        # ========================================================================
+        # Migration: Add is_trained column to track if node has trained adapter
+        try:
+            cursor.execute('ALTER TABLE nodes ADD COLUMN is_trained INTEGER DEFAULT 0')
+            logger.debug("is_trained column added (migration Phase 2)")
+        except sqlite3.OperationalError:
+            # Column already exists, not an error
+            pass
+        
+        # 5. Node Data Mapping Table (Pointers to original dataset)
+        # Purpose: Associate node_id with source_id (pointer to original dataset)
+        # This enables training by retrieving original texts from datasets
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS node_data_mapping (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                node_id TEXT NOT NULL,
+                source_id TEXT NOT NULL,
+                created_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(node_id) REFERENCES nodes(node_id) ON DELETE CASCADE,
+                UNIQUE(node_id, source_id)
+            )
+        ''')
+        
+        # Indexes for node_data_mapping
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_node_data_mapping_node_id ON node_data_mapping(node_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_node_data_mapping_source_id ON node_data_mapping(source_id)')
         
         self.conn.commit()
         logger.debug("Tables created/initialized correctly")
@@ -238,6 +305,30 @@ class KNRepository:
             }
         return None
 
+    def has_peft_weights(self, node_id: str) -> bool:
+        """
+        Check if a Knowledge Node has PEFT/LoRA weights trained.
+        
+        Added: 2025-12-27
+        Purpose: Allow Layer 2 to check if a KN needs training or already has weights.
+        
+        Args:
+            node_id: Node ID to check
+        
+        Returns:
+            True if PEFT weights exist, False otherwise
+        """
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "SELECT peft_weights FROM nodes WHERE node_id = ?",
+            (node_id,)
+        )
+        row = cursor.fetchone()
+        
+        if row and row["peft_weights"] is not None:
+            return True
+        return False
+
     def save_new_kn(self, node_id: str, centroid: torch.Tensor, mass: int, variance: float) -> None:
         """
         Register a new KnowledgeNode after buffer promotion.
@@ -312,7 +403,437 @@ class KNRepository:
             logger.error(f"SQLite error updating KN {node_id}: {e}")
             raise
 
+    def save_peft_weights(
+        self,
+        node_id: str,
+        weights_bytes: bytes,
+        format: str = "safetensors",
+        config: Optional[Dict[str, Any]] = None
+    ) -> None:
+        """
+        Save PEFT/LoRA weights for an existing Knowledge Node.
+        
+        Added: 2025-12-27
+        Purpose: Store trained adapter weights linked to a KN signature.
+        
+        Args:
+            node_id: Node ID (must exist with signature)
+            weights_bytes: Complete serialized file (.safetensors or .bin) as bytes
+            format: 'safetensors' or 'bin' (default: 'safetensors')
+            config: Optional dict with PEFT configuration (r, alpha, target_modules, etc.)
+        
+        Raises:
+            ValueError: If node doesn't exist, invalid format, or empty weights
+            sqlite3.Error: If there's a database error
+        """
+        # Validation: Node must exist
+        signature = self.get_signature(node_id)
+        if not signature:
+            raise ValueError(f"KN {node_id} does not exist. Create signature first.")
+
+        # Validation: weights_bytes must not be None
+        if weights_bytes is None:
+            raise ValueError("weights_bytes cannot be None")
+
+        # Validation: Format
+        if format not in ['safetensors', 'bin']:
+            raise ValueError(f"Invalid format: {format}. Must be 'safetensors' or 'bin'")
+
+        # Validation: Non-empty weights
+        if not isinstance(weights_bytes, bytes):
+            raise ValueError(f"weights_bytes must be bytes, got {type(weights_bytes)}")
+        if len(weights_bytes) == 0:
+            raise ValueError("weights_bytes cannot be empty")
+
+        # Validation: Size limit (optional safety check)
+        MAX_PEFT_SIZE = 50 * 1024 * 1024  # 50 MB
+        weights_size = len(weights_bytes)
+        if weights_size > MAX_PEFT_SIZE:
+            raise ValueError(f"PEFT weights too large: {weights_size} bytes (max: {MAX_PEFT_SIZE})")
+
+        # Calculate checksum
+        checksum = hashlib.sha256(weights_bytes).hexdigest()
+
+        # Serialize config to JSON string
+        config_json = json.dumps(config) if config else None
+
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                """UPDATE nodes SET 
+                    peft_weights = ?,
+                    peft_format = ?,
+                    peft_size = ?,
+                    peft_checksum = ?,
+                    peft_config = ?,
+                    peft_trained_timestamp = CURRENT_TIMESTAMP
+                WHERE node_id = ?""",
+                (weights_bytes, format, weights_size, checksum, config_json, node_id)
+            )
+            if cursor.rowcount == 0:
+                logger.warning(f"Attempt to save PEFT weights for non-existent node: {node_id}")
+                return
+            self._maybe_commit()
+            logger.debug(f"PEFT weights saved for {node_id} (format={format}, size={weights_size} bytes)")
+        except sqlite3.Error as e:
+            logger.error(f"SQLite error saving PEFT weights for {node_id}: {e}")
+            raise
+
+    def _load_lora_weights(self, node_id: str) -> Optional[Dict[str, Any]]:
+        """Internal helper to load LoRA weights from DB and return a state_dict.
+        Returns None if no weights are stored for the node.
+        """
+        peft = self.get_peft_weights(node_id)
+        if not peft:
+            return None
+        buffer = io.BytesIO(peft["weights_bytes"])
+        state_dict = torch.load(buffer, map_location=DEVICE)
+        return state_dict
+
+    def get_lora_weights(self, node_id: str) -> Optional[Dict[str, Any]]:
+        """Public method that returns the LoRA state_dict for a node, cached via LRU.
+        Uses the internal _load_lora_weights function.
+        """
+        return self._lora_cache(node_id)
+
+    def get_peft_weights(self, node_id: str) -> Optional[Dict[str, Any]]:
+        """Retrieve PEFT/LoRA weights for a Knowledge Node.
+        Returns a dict with 'weights_bytes' and metadata, or None if not present.
+        """
+        cursor = self.conn.cursor()
+        cursor.execute(
+            """SELECT peft_weights, peft_format, peft_size, peft_checksum, 
+                      peft_config, peft_trained_timestamp
+               FROM nodes WHERE node_id = ?""",
+            (node_id,)
+        )
+        row = cursor.fetchone()
+        if not row or row["peft_weights"] is None:
+            return None
+            
+        # Extract values
+        weights_bytes = row["peft_weights"]
+        format_type = row["peft_format"]
+        size = row["peft_size"]
+        stored_checksum = row["peft_checksum"]
+        config_json = row["peft_config"]
+        trained_timestamp = row["peft_trained_timestamp"]
+
+        if stored_checksum is None:
+            logger.error(f"peft_checksum is NULL for {node_id}, data may be corrupted")
+            raise ValueError(f"PEFT weights data corrupted for {node_id}: checksum is NULL")
+        
+        if format_type is None:
+            logger.error(f"peft_format is NULL for {node_id}, data may be corrupted")
+            raise ValueError(f"PEFT weights data corrupted for {node_id}: format is NULL")
+        
+        # Validation: Ensure size is a valid integer
+        if not isinstance(size, int) or size < 0:
+            logger.error(f"Invalid size value for {node_id}: {size} (type: {type(size)})")
+            raise ValueError(f"PEFT weights data corrupted for {node_id}: invalid size value")
+        
+        # Verify checksum (integrity check)
+        calculated_checksum = hashlib.sha256(weights_bytes).hexdigest()
+        if calculated_checksum != stored_checksum:
+            logger.error(f"Checksum mismatch for {node_id}: stored={stored_checksum}, calculated={calculated_checksum}")
+            raise ValueError(f"PEFT weights corrupted for {node_id}: checksum mismatch")
+        
+        # Parse config JSON
+        config = None
+        if config_json:
+            try:
+                config = json.loads(config_json)
+            except json.JSONDecodeError:
+                logger.warning(f"Invalid JSON config for {node_id}, returning None")
+                config = None
+        
+        return {
+            'weights_bytes': weights_bytes,
+            'format': format_type,
+            'size': size,
+            'checksum': stored_checksum,
+            'config': config,
+            'trained_timestamp': trained_timestamp
+        }
+
+    def delete_peft_weights(self, node_id: str) -> None:
+        """
+        Delete PEFT/LoRA weights for a Knowledge Node, keeping the signature intact.
+        
+        Added: 2025-12-27
+        Purpose: Allow re-training from scratch or removing weights without deleting the KN.
+        
+        Args:
+            node_id: Node ID
+        
+        Note:
+            This only removes PEFT weights. The signature (centroid, mass, variance) remains.
+        """
+        cursor = self.conn.cursor()
+        cursor.execute(
+            """UPDATE nodes SET 
+                peft_weights = NULL,
+                peft_format = NULL,
+                peft_size = NULL,
+                peft_checksum = NULL,
+                peft_config = NULL,
+                peft_trained_timestamp = NULL
+            WHERE node_id = ?""",
+            (node_id,)
+        )
+        
+        if cursor.rowcount == 0:
+            logger.warning(f"Attempt to delete PEFT weights for non-existent node: {node_id}")
+            return
+        
+        self._maybe_commit()
+        logger.debug(f"PEFT weights deleted for {node_id} (signature preserved)")
+
+    def set_peft_training_status(self, node_id: str, status: Optional[str]) -> None:
+        """
+        Set PEFT training status for a Knowledge Node.
+        
+        Added: 2025-12-27
+        Purpose: Track training state to enable intelligent fallback decisions in Layer 2.
+        
+        Args:
+            node_id: Node ID
+            status: 'TRAINING', 'COMPLETED', 'FAILED', or None (not training)
+        
+        Raises:
+            ValueError: If status is invalid or node doesn't exist
+            sqlite3.Error: If there's a database error
+        """
+        # Validation: Node must exist
+        signature = self.get_signature(node_id)
+        if not signature:
+            raise ValueError(f"KN {node_id} does not exist. Create signature first.")
+        
+        # Validation: Status must be valid or None
+        valid_statuses = ['TRAINING', 'COMPLETED', 'FAILED']
+        if status is not None and status not in valid_statuses:
+            raise ValueError(
+                f"Invalid training status: {status}. "
+                f"Must be one of {valid_statuses} or None"
+            )
+        
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                "UPDATE nodes SET peft_training_status = ? WHERE node_id = ?",
+                (status, node_id)
+            )
+            
+            if cursor.rowcount == 0:
+                logger.warning(f"Attempt to set training status for non-existent node: {node_id}")
+                return
+            
+            self._maybe_commit()
+            logger.debug(f"Training status set for {node_id}: {status}")
+        except sqlite3.Error as e:
+            logger.error(f"SQLite error setting training status for {node_id}: {e}")
+            raise
+
+    def get_peft_training_status(self, node_id: str) -> Optional[str]:
+        """
+        Get PEFT training status for a Knowledge Node.
+        
+        Added: 2025-12-27
+        Purpose: Check if node is currently being trained for Layer 2 decision making.
+        
+        Args:
+            node_id: Node ID
+        
+        Returns:
+            Status string ('TRAINING', 'COMPLETED', 'FAILED') or None if not set
+            Returns None if node doesn't exist (doesn't raise exception)
+        """
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "SELECT peft_training_status FROM nodes WHERE node_id = ?",
+            (node_id,)
+        )
+        row = cursor.fetchone()
+        
+        if not row:
+            # Node doesn't exist - return None (don't raise exception)
+            return None
+        
+        # Return status (can be None if not set)
+        status = row["peft_training_status"]
+        return status if status else None
+
+    # --- Phase 2: Training Support - Pointers and Training Status ---
+    
+    def save_pointer(self, node_id: str, source_id: str) -> None:
+        """
+        Save a pointer (source_id) to the original dataset for a Knowledge Node.
+        
+        Added: Phase 2 (2025-01-XX)
+        Purpose: Track which original data points (texts) contributed to each KN.
+        This enables training by retrieving original texts from datasets.
+        
+        Args:
+            node_id: Node ID (must exist)
+            source_id: ID from the original dataset (e.g., arXiv paper ID, 20newsgroups post ID)
+        
+        Raises:
+            ValueError: If node_id or source_id is invalid
+            sqlite3.Error: If there's a database error
+        
+        Note:
+            UNIQUE constraint prevents duplicate pointers (pointer integrity).
+            If pointer already exists, operation is silently ignored (idempotent).
+        """
+        # Validation
+        if not node_id or not isinstance(node_id, str):
+            raise ValueError(f"node_id must be a non-empty string, received: {node_id}")
+        
+        if not source_id or not isinstance(source_id, str):
+            raise ValueError(f"source_id must be a non-empty string, received: {source_id}")
+        
+        # Verify node exists
+        signature = self.get_signature(node_id)
+        if not signature:
+            raise ValueError(f"KN {node_id} does not exist. Create signature first.")
+        
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                "INSERT INTO node_data_mapping (node_id, source_id) VALUES (?, ?)",
+                (node_id, source_id)
+            )
+            self._maybe_commit()
+            logger.debug(f"Pointer saved: {node_id} -> {source_id}")
+        except sqlite3.IntegrityError:
+            # UNIQUE constraint violation: pointer already exists (idempotent)
+            # This is expected and not an error - silently ignore
+            logger.debug(f"Pointer already exists: {node_id} -> {source_id} (ignoring duplicate)")
+        except sqlite3.Error as e:
+            logger.error(f"SQLite error saving pointer for {node_id}: {e}")
+            raise
+    
+    def get_training_pointers(self, node_id: str) -> List[str]:
+        """
+        Retrieve all source_ids (pointers) associated with a Knowledge Node.
+        
+        Added: Phase 2 (2025-01-XX)
+        Purpose: Get all original data IDs when node reaches training threshold.
+        These source_ids are used to retrieve original texts for training.
+        
+        Args:
+            node_id: Node ID
+        
+        Returns:
+            List of source_ids (pointers to original dataset)
+            Returns empty list if node has no pointers or doesn't exist
+        
+        Example:
+            source_ids = repository.get_training_pointers("KN_45")
+            # Returns: ["arxiv:1234.5678", "arxiv:2345.6789", ...]
+            texts = data_manager.get_texts_from_pointers(source_ids)
+        """
+        # Validation
+        if not node_id or not isinstance(node_id, str):
+            raise ValueError(f"node_id must be a non-empty string, received: {node_id}")
+        
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "SELECT source_id FROM node_data_mapping WHERE node_id = ? ORDER BY created_timestamp",
+            (node_id,)
+        )
+        rows = cursor.fetchall()
+        
+        source_ids = [row["source_id"] for row in rows]
+        
+        logger.debug(f"Retrieved {len(source_ids)} pointers for {node_id}")
+        return source_ids
+    
+    def is_trained(self, node_id: str) -> bool:
+        """
+        Check if a Knowledge Node has a trained adapter.
+        
+        Added: Phase 2 (2025-01-XX)
+        Purpose: Verify if node has trained LoRA adapter before triggering training
+        or using it for inference.
+        
+        Args:
+            node_id: Node ID
+        
+        Returns:
+            True if node has trained adapter (is_trained=1), False otherwise
+            Returns False if node doesn't exist (doesn't raise exception)
+        """
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "SELECT is_trained FROM nodes WHERE node_id = ?",
+            (node_id,)
+        )
+        row = cursor.fetchone()
+        
+        if not row:
+            # Node doesn't exist - return False (don't raise exception)
+            return False
+        
+        # is_trained is INTEGER: 1 = True, 0 = False, NULL = False
+        is_trained_value = row["is_trained"]
+        return bool(is_trained_value) if is_trained_value is not None else False
+    
+    def mark_as_trained(self, node_id: str) -> None:
+        """
+        Mark a Knowledge Node as having a trained adapter.
+        
+        Added: Phase 2 (2025-01-XX)
+        Purpose: Update flag after successful training to prevent re-training
+        and enable inference with trained adapter.
+        
+        Args:
+            node_id: Node ID (must exist)
+        
+        Raises:
+            ValueError: If node doesn't exist
+            sqlite3.Error: If there's a database error
+        """
+        # Validation: Node must exist
+        signature = self.get_signature(node_id)
+        if not signature:
+            raise ValueError(f"KN {node_id} does not exist. Create signature first.")
+        
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                "UPDATE nodes SET is_trained = 1 WHERE node_id = ?",
+                (node_id,)
+            )
+            
+            if cursor.rowcount == 0:
+                logger.warning(f"Attempt to mark non-existent node as trained: {node_id}")
+                return
+            
+            self._maybe_commit()
+            logger.debug(f"Node marked as trained: {node_id}")
+        except sqlite3.Error as e:
+            logger.error(f"SQLite error marking node as trained {node_id}: {e}")
+            raise
+
     # --- Physical Memory Management (Embeddings) ---
+    
+    def apply_feedback(self, node_id: str, feedback: Any) -> None:
+        """Apply Feedback deltas to node statistics.
+        Expected feedback object has attributes `delta_mass` and `delta_variance`.
+        """
+        # Retrieve current stats
+        signature = self.get_signature(node_id)
+        if not signature:
+            logger.warning(f"apply_feedback called for unknown node {node_id}")
+            return
+        new_mass = signature["mass"] + getattr(feedback, "delta_mass", 0.0)
+        new_variance = signature["variance"] + getattr(feedback, "delta_variance", 0.0)
+        # Ensure non‑negative values
+        new_mass = max(int(new_mass), 0)
+        new_variance = max(new_variance, 0.0)
+        # Update centroid unchanged (could be recomputed elsewhere)
+        self.update_node_stats(node_id, signature["centroid"], new_mass, new_variance)
 
     def add_embedding_to_memory(self, node_id: str, embedding: torch.Tensor) -> None:
         """
@@ -405,33 +926,33 @@ class KNRepository:
                 (buffer_id,)
             )
             self._maybe_commit()
-            logger.debug(f"Buffer creado: {buffer_id}")
+            logger.debug(f"Buffer created: {buffer_id}")
         except sqlite3.IntegrityError:
-            logger.warning(f"Buffer {buffer_id} ya existe")
+            logger.warning(f"Buffer {buffer_id} already exists")
             raise
         except sqlite3.Error as e:
-            logger.error(f"Error SQLite al crear buffer {buffer_id}: {e}")
+            logger.error(f"SQLite error creating buffer {buffer_id}: {e}")
             raise
 
     def add_to_buffer(self, buffer_id: str, embedding: torch.Tensor) -> None:
         """
-        Agrega un embedding a un buffer y actualiza el centroide incrementalmente.
+        Add an embedding to a buffer and update the centroid incrementally.
         
-        Actualización incremental del centroide:
-        - Si es el primer embedding (n=0): C_new = E_new
-        - Si n > 0: C_new = (C_old * n + E_new) / (n + 1)
+        Incremental centroid update:
+        - If it's the first embedding (n=0): C_new = E_new
+        - If n > 0: C_new = (C_old * n + E_new) / (n + 1)
         
         Args:
-            buffer_id: ID del buffer
-            embedding: Tensor FP16 del embedding
+            buffer_id: Buffer ID
+            embedding: FP16 tensor of the embedding
         
         Raises:
-            ValueError: Si los parámetros son inválidos
-            sqlite3.Error: Si hay error en la base de datos
+            ValueError: If parameters are invalid
+            sqlite3.Error: If there's a database error
         """
-        # Validación
+        # Validation
         if not buffer_id or not isinstance(buffer_id, str):
-            raise ValueError(f"buffer_id debe ser un string no vacío, recibido: {buffer_id}")
+            raise ValueError(f"buffer_id must be a non-empty string, received: {buffer_id}")
         
         # Asegurar que embedding está en el formato correcto
         embedding = embedding.to(device=DEVICE, dtype=DTYPE)
@@ -474,20 +995,20 @@ class KNRepository:
             )
             
             self._maybe_commit()
-            logger.debug(f"Embedding agregado a buffer: {buffer_id} (size={current_size + 1})")
+            logger.debug(f"Embedding added to buffer: {buffer_id} (size={current_size + 1})")
         except sqlite3.Error as e:
-            logger.error(f"Error SQLite al agregar embedding a buffer {buffer_id}: {e}")
+            logger.error(f"SQLite error adding embedding to buffer {buffer_id}: {e}")
             raise
 
     def get_buffer_size(self, buffer_id: str) -> int:
         """
-        Obtiene el tamaño de un buffer.
+        Get the size of a buffer.
         
         Args:
-            buffer_id: ID del buffer
+            buffer_id: Buffer ID
         
         Returns:
-            Tamaño del buffer (0 si no existe)
+            Buffer size (0 if it doesn't exist)
         """
         cursor = self.conn.cursor()
         cursor.execute("SELECT size FROM buffers WHERE buffer_id = ?", (buffer_id,))

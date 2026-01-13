@@ -1,0 +1,37 @@
+# This CITATION.cff file was generated with cffinit.
+# Visit https://bit.ly/cffinit to generate yours today!
+
+cff-version: 1.2.0
+title: >-
+  Xctopus: Experimental Framework for Continual Learning and
+  Bayesian Inference
+message: 'If you use this software, please cite it as below.'
+type: software
+authors:
+  - given-names: Marjorie
+    family-names: Sanchez
+    email: mrjsanchez@gmail.com
+identifiers:
+  - type: doi
+    value: 10.5281/zenodo.17862644
+    description: >-
+      Xctopus is an experimental alpha-stage Continuous
+      Learning framework designed for advanced Catastrophic
+      Forgetting mitigation. Currently under active
+      development, it utilizes a hierarchical and
+      orchestrated architecture, integrating Bayesian Neural
+      Networks (BNN) and Transformers with Knowledge Nodes
+      for efficient knowledge retention.
+repository-code: 'https://github.com/msancheza/xctopus-core'
+url: 'https://xctopus.com'
+abstract: >-
+  A modular framework for mitigating catastrophic forgetting
+  using probabilistic programming and hierarchical learning.
+keywords:
+  - continual learning
+  - bayesian neural networks
+  - catastrophic forgetting
+  - knowledge graphs
+license: MIT
+version: '1.0.0' 
+date-released: '2025-12-17' 

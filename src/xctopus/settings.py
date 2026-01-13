@@ -12,7 +12,17 @@ from pathlib import Path
 # ============================================================================
 
 DTYPE = torch.float16  # Force medium precision
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"  # Use GPU if available
+
+# Device detection: prioritize CUDA, then MPS, fallback to CPU
+# Note: MPS may have issues with BFloat16, so we can force CPU if needed
+if torch.cuda.is_available():
+    DEVICE = "cuda"
+elif torch.backends.mps.is_available():
+    # MPS available but may have dtype compatibility issues
+    # For now, use MPS if available (can be forced to "cpu" if issues occur)
+    DEVICE = "mps"
+else:
+    DEVICE = "cpu"
 
 # ============================================================================
 # Similarity and Routing Parameters (FilterBayesianNode)
@@ -46,6 +56,19 @@ SAVE_BATCH_SIZE = 10  # How many updates before committing to SQLite to avoid bl
 REFRESH_INTERVAL = 10  # How many processed embeddings before refreshing FilterBayesian signatures
 
 # ============================================================================
+# Phase 2: Training Parameters
+# ============================================================================
+
+TRAINING_THRESHOLD = 20  # Minimum mass (number of embeddings) to trigger training
+                         # When a KnowledgeNode reaches this mass, it will be queued for training
+                         # Range: 20-50 for testing/development, 50-100 for production
+                         # Lower values = faster training triggers, but less stable gradients
+MAX_CONCURRENT_TRAINING = 2  # Maximum concurrent training tasks (limited by ThreadPoolExecutor)
+MIN_TRAINING_TEXTS = 10  # Minimum number of texts required for stable training
+                          # Too few texts (e.g., < 10) can lead to unstable gradients and overfitting
+                          # This ensures training quality and prevents gradient instability
+
+# ============================================================================
 # Knowledge Nodes Fusion Parameters
 # ============================================================================
 
@@ -55,12 +78,22 @@ FUSION_MAX_VARIANCE = 0.5  # Maximum variance to consider a KN as "Stable" (defa
 FUSION_VARIANCE_INCREASE_THRESHOLD = 0.1  # Maximum variance increase allowed after fusion (default: 0.1)
 
 # ============================================================================
-# Layer 1 Identity Parameters (Clustering)
+# Layer 2 & 3 Identity Parameters
 # ============================================================================
 # (These are used to initialize KnowledgeNodes even if Transformer is on standby)
 
 MODEL_BASE_NAME = "sentence-transformers/all-MiniLM-L6-v2"  # Base model for embeddings
+LLM_MODEL_ID = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"  # Layer 2 Model (Open source, small for testing)
+LOAD_IN_8BIT = False  # Set to True only if bitsandbytes is fully working (Linux/CUDA often required)
 LORA_RANK_DEFAULT = 4  # Default rank for LoRA adapters
+
+# ============================================================================
+# Post-Processing Parameters (Layer 3 Judgment)
+# ============================================================================
+
+PP_HIGH_THRESHOLD = 0.85  # Minimum confidence to reinforce a node
+PP_LOW_THRESHOLD = 0.50   # Maximum confidence to suggest NEW_BUFFER (rejection)
+PP_ETA = 0.05             # Learning rate for variance adjustment
 
 # ============================================================================
 # Logging Configuration

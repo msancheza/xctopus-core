@@ -1,51 +1,324 @@
-# Python
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
-*.so
-*.egg-info/
+# ============================================================================
+# Xctopus - Comprehensive .gitignore
+# ============================================================================
+# This file ensures that generated files, databases, logs, and temporary
+# files are not accidentally committed to the repository.
+# ============================================================================
 
-# Environments
-env/
-venv/
-.venv/
-docs/
-notebooks_build/
-scripts/
-scripts/deprecated/
-datasets/
-examples/
-tests/
-# Jupyter
-.ipynb_checkpoints/
-
-# Secrets / Config
-*.env
-config.local.yaml
-
-# Data (raw or large)
-data/**/*.csv
-data/**/*.json
-data/**/*.txt
-data/**/*.pt
-data/**/*.ckpt
-data/**/*.bin
-
-# Models
-models/
-*.pt
-*.ckpt
-*.safetensors
-
-# Logs
-logs/
-*.log
-
-# Database
+# ============================================================================
+# SQLite Databases (CRITICAL - These can be very large)
+# ============================================================================
+# Main database file
+knowledge_base.sqlite
 *.sqlite
 *.sqlite3
-knowledge_base.sqlite
+*.db
+*.db3
+
+# SQLite WAL (Write-Ahead Logging) files
+*.sqlite-shm
+*.sqlite-wal
+*-shm
+*-wal
+
+# ============================================================================
+# Logs (CRITICAL - Can grow very large)
+# ============================================================================
+logs/
+*.log
+*.log.*
+*.log.[0-9]*
+
+# Specific log files
+xctopus.log
+bayesian_filter.log
+*.log.gz
+*.log.bz2
+
+# ============================================================================
+# Python
+# ============================================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# ============================================================================
+# Virtual Environments
+# ============================================================================
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+.venv/
+.conda/
+
+# ============================================================================
+# Jupyter Notebooks
+# ============================================================================
+.ipynb_checkpoints/
+*.ipynb_checkpoints/
+*/.ipynb_checkpoints/*
+
+# ============================================================================
+# IDEs and Editors
+# ============================================================================
+# VSCode
+.vscode/
+*.code-workspace
+
+# PyCharm
+.idea/
+*.iml
+*.iws
+*.ipr
+
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+
+# Vim
+*.swp
+*.swo
+*~
+.vim/
+
+# Emacs
+*~
+\#*\#
+/.emacs.desktop
+/.emacs.desktop.lock
+*.elc
+auto-save-list
+tramp
+.\#*
+
+# ============================================================================
+# OS Files
+# ============================================================================
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+._*
+.DocumentRevisions-V100
+.fseventsd
+.Spotlight-V100
+.TemporaryItems
+.Trashes
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+.AppleDB
+.AppleDesktop
+Network Trash Folder
+Temporary Items
+.apdisk
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+*.stackdump
+[Dd]esktop.ini
+$RECYCLE.BIN/
+*.cab
+*.msi
+*.msix
+*.msm
+*.msp
+*.lnk
+
+# Linux
+*~
+.fuse_hidden*
+.directory
+.Trash-*
+.nfs*
+
+# ============================================================================
+# Datasets and Large Data Files
+# ============================================================================
+# CSV files (can be very large)
+*.csv
+!requirements.csv
+!*.example.csv
+
+# Data directories
+data/
+datasets/
+raw_data/
+processed_data/
+*.data/
+
+# Large binary files
+*.npy
+*.npz
+*.h5
+*.hdf5
+*.parquet
+*.feather
+
+# ============================================================================
+# Model Files (Can be very large)
+# ============================================================================
+models/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.bin
+*.onnx
+*.pb
+*.tflite
+*.h5
+*.hdf5
+checkpoints/
+weights/
+*.weights
+
+# ============================================================================
+# Embeddings and Vectors
+# ============================================================================
+embeddings/
+*.embeddings
+*.vectors
+*.vec
+*_embeddings.npy
+*_embeddings.npz
+
+# ============================================================================
+# Temporary Files
+# ============================================================================
+*.tmp
+*.temp
+*.bak
+*.backup
+*.old
+*.orig
+*.save
+*.swp
+*.swo
+*~
+.cache/
+tmp/
+temp/
+.tmp/
+
+# ============================================================================
+# Configuration and Secrets
+# ============================================================================
+# Environment variables
+.env
+.env.local
+.env.*.local
+*.env
+
+# Local configuration
+config.local.yaml
+config.local.yml
+*.local.yaml
+*.local.yml
+secrets.yaml
+secrets.yml
+credentials.json
+credentials.yaml
+
+# ============================================================================
+# Documentation Build
+# ============================================================================
+docs/
+docs/_build/
+docs/.doctrees/
+site/
+*.html
+!docs/*.html
+
+# ============================================================================
+# Testing
+# ============================================================================
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+.hypothesis/
+*.cover
+*.py,cover
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+
+# ============================================================================
+# Project Specific
+# ============================================================================
+# Notebooks build folder (personal notebooks - not for GitHub)
+notebooks_build/
+
+# Notebooks output (generated files from notebooks)
+notebooks/*.csv
+notebooks/*.npy
+notebooks/*.npz
+notebooks/*.sqlite
+notebooks/*.log
+notebooks/results/
+notebooks/outputs/
+
+# Legacy folders (removed - not compatible with Layer 1)
+tests/
+scripts/
 
 # Repository data (legacy/generated - NOT needed for GitHub)
+# This folder contains generated files from old code versions
+# Current code uses SQLite BLOBs instead of file-based storage
 repository_data/
+!repository_data/.gitkeep
+
+# ============================================================================
+# Archives
+# ============================================================================
+*.zip
+*.tar
+*.tar.gz
+*.rar
+*.7z
+*.gz
+*.bz2
+
+# ============================================================================
+# Miscellaneous
+# ============================================================================
+*.pid
+*.seed
+*.pid.lock
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+.pytype/
+.cython/
+*.prof
+*.lprof
+*.pstats
