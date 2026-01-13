@@ -13,7 +13,7 @@
 
 </div>
 
-Xctopus (Alpha) is an adaptive knowledge architecture designed to mitigate Catastrophic Forgetting through distributed epistemic memory. The system organizes information flows into hierarchical structures of Knowledge Nodes (KNs) that evolve dynamically according to the nature of the data.
+Xctopus (Alpha): Autonomous Knowledge Induction & Dynamic LoRA Orchestration
 
 The system is built from Transformers, Bayesian Nodes, and modular knowledge orchestration. It implements an **Adaptive Knowledge Architecture** that automatically adjusts its granularity according to domain complexity.
 
