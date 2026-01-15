@@ -13,7 +13,7 @@ import torch.nn.functional as F
 import logging
 from typing import List, Dict, Tuple, Any, Optional
 
-from .settings import S_MIN, LAMBDA_FACTOR, DEVICE, DTYPE
+from .settings import S_MIN, LAMBDA_FACTOR, THRESH_DECAY, THRESH_MIN_LOG, DEVICE, DTYPE
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +78,34 @@ class FilterBayesian:
         
         logger.debug(f"Signatures updated: {len(self.ids)} active nodes")
 
+    def partial_update(self, node_id: str, new_centroid: torch.Tensor, new_mass: int) -> None:
+        """
+        Incrementally update a single node's state in memory.
+        
+        This avoids full re-initialization of tensors (O(1) vs O(N)).
+        
+        Args:
+            node_id: The ID of the node to update
+            new_centroid: New centroid tensor [384]
+            new_mass: New mass value
+        """
+        if node_id not in self.ids:
+            # If node doesn't exist in current state, we can't update it cheaply
+            # This shouldn't happen in normal flow if signatures are refreshed periodically
+            logger.warning(f"Attempted partial update on unknown node {node_id}")
+            return
+
+        idx = self.ids.index(node_id)
+        
+        # Ensure correct device/dtype
+        new_centroid = new_centroid.to(device=DEVICE, dtype=DTYPE)
+        
+        # In-place updates
+        self.centroids[idx] = new_centroid
+        self.masses[idx] = float(new_mass)
+        
+        logger.debug(f"Partial update for {node_id}: mass {new_mass}")
+
     def route(self, embedding: torch.Tensor) -> Tuple[str, float]:
         """
         Optimized matrix routing using the 4 Golden Rules.
@@ -97,7 +125,7 @@ class FilterBayesian:
         
         Implements:
             - Rule 1: Critical Mass (log1p(mass) * LAMBDA_FACTOR)
-            - Rule 2: Semantic Purity (S_MIN threshold)
+            - Rule 2: Semantic Purity (Dynamic S_MIN threshold)
             - Rule 3: Singularity (NEW_BUFFER if no match)
             - Rule 4: Stability (uses signatures from Repository)
         """
@@ -139,17 +167,43 @@ class FilterBayesian:
         sims = F.cosine_similarity(embedding.unsqueeze(0), self.centroids, dim=1)
 
         # ========================================================================
-        # Rule 2: Semantic Purity (Internal Cohesion)
-        # Only consider nodes that exceed the semantic threshold
+        # Rule 2: Semantic Purity (Dynamic Threshold)
+        # S_EFF = S_MIN - (THRESH_DECAY / log1p(mass))
+        # Smaller nodes are more permissive, larger nodes are stricter
         # ========================================================================
         
-        valid_mask = sims >= S_MIN
+        # Calculate dynamic thresholds for all nodes
+        # Note: self.masses contains raw mass values (float)
+        
+        mass_log = torch.log1p(self.masses)
+        
+        # Avoid division by zero if mass is 0 (shouldn't happen but safety first)
+        # log1p(0) = 0. log1p(1) = 0.69. 
+        # Clamp to THRESH_MIN_LOG to ensure numerical stability
+        mass_log_safe = torch.clamp(mass_log, min=THRESH_MIN_LOG)
+        
+        # Calculate individual thresholds using THRESH_DECAY from settings
+        dynamic_thresholds = S_MIN - (THRESH_DECAY / mass_log_safe)
+        
+        # Dynamic threshold behavior:
+        # - Small nodes (mass=6): log1p(6)~1.94 -> threshold ≈ S_MIN - 0.077 ≈ 0.52
+        # - Medium nodes (mass=20): log1p(20)~3.04 -> threshold ≈ S_MIN - 0.049 ≈ 0.55
+        # - Large nodes (mass=100): log1p(100)~4.6 -> threshold ≈ S_MIN - 0.033 ≈ 0.57
+        # As mass grows, threshold converges to S_MIN (more restrictive, maintains semantic purity) 
+        # S_MIN - big_number (small mass) is much lower. 
+        # So small nodes get LOWER threshold (more permissive). Correct.
+        
+        valid_mask = sims >= dynamic_thresholds
         
         if not torch.any(valid_mask):
             max_sim = sims.max().item()
+            # Find what the threshold would have been for the best match
+            best_idx = torch.argmax(sims)
+            req_thresh = dynamic_thresholds[best_idx].item()
+            
             logger.debug(
-                f"Embedding does not exceed S_MIN={S_MIN:.3f} "
-                f"(max_sim={max_sim:.3f}), returning NEW_BUFFER"
+                f"No match > dynamic threshold (max_sim={max_sim:.3f} vs req={req_thresh:.3f}), "
+                "returning NEW_BUFFER"
             )
             # Rule 3: Singularity - return NEW_BUFFER
             return "NEW_BUFFER", 0.0
@@ -160,7 +214,7 @@ class FilterBayesian:
         # Favors large nodes when similarities are close
         # ========================================================================
         
-        scores = sims + torch.log1p(self.masses) * LAMBDA_FACTOR
+        scores = sims + mass_log * LAMBDA_FACTOR
 
         # Penalize invalid nodes so they're not selected by argmax
         scores[~valid_mask] = -100.0 
@@ -174,10 +228,11 @@ class FilterBayesian:
         best_sim = sims[best_idx].item()
         best_mass = self.masses[best_idx].item()
         best_node_id = self.ids[best_idx]
+        best_thresh = dynamic_thresholds[best_idx].item()
         
         logger.debug(
             f"Successful routing: {best_node_id} "
-            f"(sim={best_sim:.3f}, mass={best_mass:.0f}, score={best_score:.4f})"
+            f"(sim={best_sim:.3f} >= {best_thresh:.3f}, mass={best_mass:.0f}, score={best_score:.4f})"
         )
         
         return best_node_id, best_score

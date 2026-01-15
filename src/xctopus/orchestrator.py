@@ -9,6 +9,7 @@ import torch
 import torch.nn.functional as F
 import logging
 import warnings
+import threading
 from typing import Dict, Tuple, Optional, List, Any
 from uuid import uuid4
 from collections import OrderedDict
@@ -29,8 +30,11 @@ from .settings import (
     DTYPE,
     EMBEDDING_DIM,
     S_MIN,
-    REFRESH_INTERVAL,
+    # REFRESH_INTERVAL,  # DEPRECATED: No longer used (signatures updated immediately)
     TRAINING_THRESHOLD,
+    MAX_CONCURRENT_TRAINING,
+    TRAINING_DELTA_MULTIPLIER,
+    TRAINING_DELTA_TIMEOUT_DAYS,
 )
 from .data_manager import DataManager
 
@@ -125,8 +129,23 @@ class Orchestrator:
         # This allows Layer 2 to update statistics without blocking user response
         # Phase 2: Also used for asynchronous training tasks
         # ========================================================================
-        self._update_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="xctopus-update")
-        logger.debug("Async update executor initialized (max 2 workers)")
+        # CRITICAL: Use MAX_CONCURRENT_TRAINING to limit concurrent training tasks
+        # This prevents multiple threads from accessing TransformerBase singleton simultaneously
+        # ========================================================================
+        self._update_executor = ThreadPoolExecutor(
+            max_workers=MAX_CONCURRENT_TRAINING, 
+            thread_name_prefix="xctopus-update"
+        )
+        logger.debug(f"Async update executor initialized (max {MAX_CONCURRENT_TRAINING} workers)")
+        
+        # ========================================================================
+        # CRITICAL: Lock for TransformerBase singleton (2025-01-14)
+        # ========================================================================
+        # TransformerBase singleton is NOT thread-safe for concurrent training.
+        # This lock ensures only one training task accesses the singleton at a time.
+        # ========================================================================
+        self._training_lock = threading.Lock()
+        logger.debug("Training lock initialized for TransformerBase singleton protection")
          
         # Layer 3 components (Lazy Init or passed in?)
         # For simplicity, we initialize them here or expect them injected.
@@ -179,6 +198,14 @@ class Orchestrator:
                 continue
         
         logger.info(f"{len(self.active_nodes)} nodes loaded into active_nodes")
+        
+        # ========================================================================
+        # CRITICAL: Initialize FilterBayesian with loaded signatures
+        # ========================================================================
+        # This was missing! The filter needs the signatures to route embeddings
+        # ========================================================================
+        self.filter.refresh_signatures(signatures)
+        logger.debug(f"FilterBayesian initialized with {len(signatures)} signatures")
         
         # Initialize counters from database (warmup)
         self.kn_count = len(self.active_nodes)
@@ -457,14 +484,8 @@ class Orchestrator:
         # ========================================================================
         self._check_and_trigger_training(node_id, signature)
         
-        # Intelligent refresh: update FilterBayesian every REFRESH_INTERVAL embeddings
-        if signature["mass"] % REFRESH_INTERVAL == 0:
-            new_signatures = self.repository.get_all_signatures()
-            self.filter.refresh_signatures(new_signatures)
-            logger.debug(
-                f"Signatures refreshed in FilterBayesian "
-                f"(node '{node_id}' reached mass={signature['mass']})"
-            )
+        # Note: FilterBayesian is now refreshed immediately after each embedding
+        # is accepted (see above). This ensures centroids evolve in real-time.
         
         logger.debug(
             f"Embedding processed in node '{node_id}': "
@@ -637,6 +658,22 @@ class Orchestrator:
         self.kn_count += 1
         self.buffer_count -= 1
         
+        # ========================================================================
+        # CRITICAL: Update FilterBayesian with new node (2025-01-14)
+        # ========================================================================
+        # When a new node is created, FilterBayesian must be updated so it can
+        # route future embeddings to this new node. Without this, the new node
+        # will never receive embeddings because FilterBayesian doesn't know it exists.
+        # ========================================================================
+        # Refresh all signatures to include the new node
+        # This is O(N) but only happens when promoting buffers (infrequent)
+        all_signatures = self.repository.get_all_signatures()
+        self.filter.refresh_signatures(all_signatures)
+        logger.debug(
+            f"FilterBayesian refreshed with new node '{node_id}' "
+            f"(total signatures: {len(all_signatures)})"
+        )
+        
         logger.info(
             f"Buffer '{buffer_id}' promoted to KnowledgeNode '{node_id}': "
             f"mass={signature['mass']}, variance={signature['variance']:.4f} "
@@ -668,6 +705,26 @@ class Orchestrator:
             "kn_count": self.kn_count,
             "buffer_count": self.buffer_count
         }
+    
+    def has_active_training(self) -> bool:
+        """
+        Check if there are any active training tasks.
+        
+        Returns:
+            True if any node is currently training, False otherwise
+        """
+        # Check if there are any training futures that are not done
+        if self._training_futures:
+            for future in self._training_futures.values():
+                if not future.done():
+                    return True
+        
+        # Also check active nodes for is_training flag (faster check)
+        for kn in self.active_nodes.values():
+            if kn.is_training:
+                return True
+        
+        return False
     
     def get_active_node_count(self) -> int:
         """
@@ -924,6 +981,87 @@ class Orchestrator:
         self.repository.update_node_stats(node_id, centroid, mass, variance)
         logger.debug(f"Sync update completed for node '{node_id}' (mass={mass}, variance={variance:.4f})")
     
+    def run_deferred_training(self, progress_interval: int = 1) -> Dict[str, Any]:
+        """
+        Execute deferred training for all nodes marked as needing training.
+        
+        Added: 2025-01-14
+        Purpose: Run training for all nodes marked with needs_training flag.
+        This method runs after processing is complete (Layer 2: Specialization).
+        It trains all nodes sequentially, one at a time.
+        
+        Flow:
+        1. Get all nodes with needs_training = 1
+        2. For each node:
+           a. Activate training buffer
+           b. Re-fetch all current source_ids
+           c. Get texts
+           d. Train adapter
+           e. Save weights
+           f. Process training buffer
+           g. Clear flags
+        
+        Args:
+            progress_interval: How often to log progress (default: every node)
+        
+        Returns:
+            Dictionary with training statistics:
+            - total_pending: Total nodes pending training
+            - trained: Number of nodes successfully trained
+            - failed: Number of nodes that failed training
+        """
+        pending = self.repository.get_pending_training_nodes()
+        
+        if not pending:
+            logger.info("No nodes pending training")
+            return {
+                "total_pending": 0,
+                "trained": 0,
+                "failed": 0
+            }
+        
+        logger.info(f"Starting deferred training for {len(pending)} nodes")
+        
+        trained = 0
+        failed = 0
+        
+        for i, node_id in enumerate(pending, 1):
+            logger.info(f"Training node {i}/{len(pending)}: {node_id}")
+            
+            try:
+                # Use existing _async_train_kn but run synchronously
+                # (we're already in a separate phase, no need for thread pool)
+                self._async_train_kn(node_id)
+                trained += 1
+                
+                if i % progress_interval == 0:
+                    logger.info(f"Progress: {i}/{len(pending)} nodes trained ({trained} successful, {failed} failed)")
+                    
+            except Exception as e:
+                logger.error(f"Failed to train node '{node_id}': {e}", exc_info=True)
+                failed += 1
+                # Ensure flags are cleared even on error
+                try:
+                    kn = self.active_nodes.get(node_id)
+                    if kn:
+                        kn.is_training = False
+                    self.repository.set_peft_training_status(node_id, 'FAILED')
+                    self.repository.clear_training_flag(node_id)
+                except Exception:
+                    pass  # Don't fail on cleanup
+                continue
+        
+        logger.info(
+            f"Deferred training completed: {trained} trained, {failed} failed "
+            f"(out of {len(pending)} total)"
+        )
+        
+        return {
+            "total_pending": len(pending),
+            "trained": trained,
+            "failed": failed
+        }
+    
     def shutdown(self) -> None:
         """
         Shutdown the Orchestrator and clean up resources.
@@ -1030,6 +1168,25 @@ class Orchestrator:
         )
         
         # ========================================================================
+        # CRITICAL: Update FilterBayesian signature immediately (2025-01-14)
+        # ========================================================================
+        # When a node accepts an embedding, its centroid moves immediately.
+        # FilterBayesian must be updated immediately so the new centroid is used
+        # for the next routing decisions. This allows the node to "attract" more
+        # similar embeddings as its centroid evolves.
+        # ========================================================================
+        # Optimization: Use partial_update (O(1)) instead of refresh_signatures (O(N))
+        self.filter.partial_update(
+            node_id=signature["node_id"],
+            new_centroid=signature["centroid"],
+            new_mass=signature["mass"]
+        )
+        logger.debug(
+            f"FilterBayesian signature updated incrementally for node '{node_id}': "
+            f"mass={signature['mass']}, centroid updated"
+        )
+        
+        # ========================================================================
         # Phase 2: Training Threshold Check (2025-01-XX)
         # ========================================================================
         # Check if node has reached training threshold and should be queued for training
@@ -1040,14 +1197,21 @@ class Orchestrator:
     
     def _check_and_trigger_training(self, node_id: str, signature: Dict[str, Any]) -> None:
         """
-        Check if node should be queued for training and trigger if conditions are met.
+        Check if node should be marked for training (deferred training).
         
-        Phase 2: Training Trigger Logic
+        CHANGED: 2025-01-14 - Now only marks needs_training flag instead of starting training.
+        This allows processing to continue without blocking.
         
-        Conditions:
+        Phase 2: Deferred Training Trigger Logic
+        
+        Conditions for first training:
         1. Node mass >= TRAINING_THRESHOLD
-        2. Node is not already trained (repository.is_trained(node_id) == False)
-        3. Node is not currently training (kn.is_training == False)
+        2. Node is not already trained
+        3. Node is not already marked for training
+        
+        Conditions for re-training (Training Delta):
+        1. Node is already trained
+        2. Node mass >= last_training_mass * TRAINING_DELTA_MULTIPLIER (default: 2x)
         
         Args:
             node_id: Knowledge Node ID
@@ -1061,31 +1225,40 @@ class Orchestrator:
             
             mass = signature.get("mass", 0)
             
-            # Condition 1: Check mass threshold
-            if mass < TRAINING_THRESHOLD:
-                return  # Not enough mass yet
+            # Check if already marked for training (avoid duplicate marks)
+            # We check this first to avoid unnecessary DB queries
+            pending_nodes = self.repository.get_pending_training_nodes()
+            if node_id in pending_nodes:
+                return  # Already marked
             
-            # Condition 2: Check if already trained
-            if self.repository.is_trained(node_id):
-                logger.debug(f"Node '{node_id}' already trained, skipping training trigger")
+            # ========================================================================
+            # Case 1: First Training (threshold reached)
+            # ========================================================================
+            if mass >= TRAINING_THRESHOLD and not self.repository.is_trained(node_id):
+                self.repository.mark_for_training(node_id, is_retraining=False)
+                logger.debug(
+                    f"Node '{node_id}' marked for training (mass={mass} >= {TRAINING_THRESHOLD})"
+                )
                 return
             
-            # Condition 3: Check if currently training
-            kn = self.active_nodes.get(node_id)
-            if kn is None:
-                logger.debug(f"Node '{node_id}' not in active_nodes, skipping training trigger")
-                return
+            # ========================================================================
+            # Case 2: Re-training (Training Delta - mass doubling)
+            # ========================================================================
+            if TRAINING_DELTA_MULTIPLIER > 0 and self.repository.is_trained(node_id):
+                last_training_mass = self.repository.get_last_training_mass(node_id)
+                if last_training_mass > 0 and mass >= last_training_mass * TRAINING_DELTA_MULTIPLIER:
+                    self.repository.mark_for_training(node_id, is_retraining=True)
+                    logger.debug(
+                        f"Node '{node_id}' marked for re-training "
+                        f"(mass={mass} >= {last_training_mass * TRAINING_DELTA_MULTIPLIER})"
+                    )
+                    return
             
-            if kn.is_training:
-                logger.debug(f"Node '{node_id}' is already training, skipping duplicate trigger")
-                return
-            
-            # All conditions met - queue training task
-            logger.debug(
-                f"Training threshold reached for node '{node_id}': "
-                f"mass={mass} >= {TRAINING_THRESHOLD}"
-            )
-            self._queue_training_task(node_id)
+            # ========================================================================
+            # Case 3: Timeout-based re-training (optional)
+            # ========================================================================
+            # TODO: Implement timeout-based re-training if TRAINING_DELTA_TIMEOUT_DAYS > 0
+            # This would require storing last_training_timestamp in DB
             
         except Exception as e:
             # Don't interrupt flow if training check fails
@@ -1155,36 +1328,56 @@ class Orchestrator:
         Args:
             node_id: Knowledge Node ID to train
         """
+        # ========================================================================
+        # CRITICAL: Thread Safety for SQLite (2025-01-14)
+        # ========================================================================
+        # We MUST create a fresh Repository instance for this thread.
+        # Sharing self.repository (and its self.conn) across threads causes
+        # "database is locked" errors and potential hangs/crashes because
+        # sqlite3 connection objects are not thread-safe for concurrent cursor usage.
+        # ========================================================================
+        thread_repo = KNRepository(self.repository.db_path)
+        
         try:
             logger.debug(f"Starting training for node '{node_id}'")
             
-            # 1. Get source_ids from Repository
-            source_ids = self.repository.get_training_pointers(node_id)
+            # 1. Activate training buffer (embeddings that arrive during training will be buffered)
+            self.repository.set_peft_training_status(node_id, 'TRAINING')
+            kn = self.active_nodes.get(node_id)
+            if kn:
+                kn.is_training = True
+                logger.debug(f"Training buffer activated for node '{node_id}'")
+            
+            # 2. RE-FETCH: Get ALL current source_ids (not just those at threshold time)
+            # This ensures we train with the most up-to-date data
+            source_ids = thread_repo.get_training_pointers(node_id)
             
             if not source_ids:
                 logger.debug(f"No source_ids found for node '{node_id}', cannot train")
-                # Mark as not training
-                kn = self.active_nodes.get(node_id)
+                # Clean up
                 if kn:
                     kn.is_training = False
-                self.repository.set_peft_training_status(node_id, None)
+                thread_repo.set_peft_training_status(node_id, None)
+                thread_repo.clear_training_flag(node_id)
                 return
             
-            logger.debug(f"Retrieved {len(source_ids)} source_ids for node '{node_id}'")
+            logger.debug(f"Re-fetched {len(source_ids)} source_ids for node '{node_id}' (current state)")
             
-            # 2. Translate source_ids to texts using DataManager
+            # 3. Translate source_ids to texts using DataManager
+            # DataManager generally reads from creating files or separate DB, verify safety
+            # Assuming DataManager is thread-safe (read-only usually) or handles its own locking
             texts = self.data_manager.get_texts_from_pointers(source_ids)
             
             if not texts:
                 logger.debug(f"No texts found for node '{node_id}', cannot train")
-                # Mark as not training
-                kn = self.active_nodes.get(node_id)
+                # Clean up
                 if kn:
                     kn.is_training = False
-                self.repository.set_peft_training_status(node_id, None)
+                thread_repo.set_peft_training_status(node_id, None)
+                thread_repo.clear_training_flag(node_id)
                 return
             
-            logger.debug(f"Retrieved {len(texts)} texts for node '{node_id}'")
+            logger.debug(f"Retrieved {len(texts)} texts for node '{node_id}' (re-fetched at training time)")
             
             # 3. Train adapter using TransformerBase
             # Note: This method doesn't exist yet in TransformerBase, will be implemented later
@@ -1198,10 +1391,42 @@ class Orchestrator:
                 kn = self.active_nodes.get(node_id)
                 if kn:
                     kn.is_training = False
-                self.repository.set_peft_training_status(node_id, None)
+                thread_repo.set_peft_training_status(node_id, None)
                 return
             
-            weights_bytes = self.transformer.train_kn_adapter(node_id, texts)
+            # ========================================================================
+            # Get estimated_epochs from repository (if available) (2026-01-14)
+            # ========================================================================
+            # Use calculated estimated_epochs if available, otherwise use default (3)
+            # This enables adaptive training based on node complexity
+            # ========================================================================
+            estimated_epochs = thread_repo.get_estimated_epochs(node_id)
+            epochs = estimated_epochs if estimated_epochs is not None else 3
+            
+            if estimated_epochs is not None:
+                logger.debug(
+                    f"Node '{node_id}' will train with {epochs} epochs "
+                    f"(estimated from complexity analysis)"
+                )
+            else:
+                logger.debug(
+                    f"Node '{node_id}' will train with {epochs} epochs "
+                    f"(default, estimated_epochs not set)"
+                )
+            
+            # ========================================================================
+            # CRITICAL: Thread Safety for TransformerBase Singleton (2025-01-14)
+            # ========================================================================
+            # TransformerBase singleton is NOT thread-safe for concurrent training.
+            # We MUST acquire the lock before training to prevent race conditions.
+            # This ensures only one training task modifies the shared base model at a time.
+            # ========================================================================
+            with self._training_lock:
+                weights_bytes = self.transformer.train_kn_adapter(
+                    node_id, 
+                    texts,
+                    epochs=epochs  # Use calculated epochs
+                )
             
             if weights_bytes is None:
                 logger.debug(f"Training returned None weights for node '{node_id}'")
@@ -1209,21 +1434,32 @@ class Orchestrator:
                 kn = self.active_nodes.get(node_id)
                 if kn:
                     kn.is_training = False
-                self.repository.set_peft_training_status(node_id, 'FAILED')
+                thread_repo.set_peft_training_status(node_id, 'FAILED')
                 return
             
             # 4. Save weights to Repository
-            self.repository.save_peft_weights(
+            thread_repo.save_peft_weights(
                 node_id,
                 weights_bytes,
                 format="safetensors"
             )
             logger.debug(f"PEFT weights saved for node '{node_id}'")
             
-            # 5. Mark as trained
-            self.repository.mark_as_trained(node_id)
-            self.repository.set_peft_training_status(node_id, 'COMPLETED')
-            logger.debug(f"Node '{node_id}' marked as trained")
+            # 5. Mark as trained and update last_training_mass
+            thread_repo.mark_as_trained(node_id)
+            thread_repo.set_peft_training_status(node_id, 'COMPLETED')
+            
+            # Update last_training_mass for Training Delta (re-training when mass doubles)
+            current_signature = thread_repo.get_signature(node_id)
+            if current_signature:
+                current_mass = current_signature.get('mass', 0)
+                thread_repo.update_last_training_mass(node_id, current_mass)
+                logger.debug(f"Node '{node_id}' marked as trained (mass={current_mass})")
+            else:
+                logger.debug(f"Node '{node_id}' marked as trained")
+            
+            # Clear needs_training flag
+            thread_repo.clear_training_flag(node_id)
             
             # 6. Process training buffer (embeddings received during training)
             kn = self.active_nodes.get(node_id)
@@ -1244,7 +1480,7 @@ class Orchestrator:
                         if accepted and src_id is not None:
                             # Save pointer
                             try:
-                                self.repository.save_pointer(node_id, src_id)
+                                thread_repo.save_pointer(node_id, src_id)
                             except Exception:
                                 pass  # Don't interrupt buffer processing
                     except Exception as e:
@@ -1252,7 +1488,7 @@ class Orchestrator:
                 
                 # Update statistics after processing buffer
                 signature = kn.get_signature()
-                self.repository.update_node_stats(
+                thread_repo.update_node_stats(
                     node_id=signature["node_id"],
                     centroid=signature["centroid"],
                     mass=signature["mass"],
@@ -1260,7 +1496,15 @@ class Orchestrator:
                 )
                 
                 # Check if new threshold reached (recursive training trigger)
-                self._check_and_trigger_training(node_id, signature)
+                # Note: recursive trigger uses the MAIN loop logic (check_and_trigger), 
+                # but calls queue_training_task -> submits new future.
+                # Since we are in a thread, calling self._check_and_trigger_training(node_id, signature)
+                # is safe IF it only reads/submits. 
+                # But _check_and_trigger uses self.repository which is the SHARED one.
+                # However, it only does READS (is_trained) which *might* be ok, 
+                # but ideally we should avoid self.repository in thread.
+                # For safety, let's skip recursive trigger for now or replicate logic.
+                # Or just let the next update trigger it.
                 
                 # Clear buffer
                 kn.training_buffer.clear()
@@ -1270,28 +1514,28 @@ class Orchestrator:
             # 7. Clear training flag
             if kn:
                 kn.is_training = False
-            
-            # Remove from futures tracking
-            self._training_futures.pop(node_id, None)
-            
-            logger.debug(f"Training completed successfully for node '{node_id}'")
-            
+                
         except Exception as e:
-            # Error handling
-            logger.debug(f"Training failed for node '{node_id}': {e}", exc_info=True)
-            
-            # Mark as failed
+            logger.error(f"Error in _async_train_kn for node '{node_id}': {e}", exc_info=True)
+            # Ensure flag is cleared
             kn = self.active_nodes.get(node_id)
             if kn:
                 kn.is_training = False
                 # Clear buffer on error (embeddings will be reprocessed on next routing)
                 kn.training_buffer.clear()
-                kn.training_buffer_source_ids.clear()
+                if hasattr(kn, 'training_buffer_source_ids'):
+                    kn.training_buffer_source_ids.clear()
             
+            # Mark as failed in thread-local repository
             try:
-                self.repository.set_peft_training_status(node_id, 'FAILED')
+                thread_repo.set_peft_training_status(node_id, 'FAILED')
             except Exception:
                 pass  # Don't fail on status update
+        finally:
+            # CRITICAL: Close the thread-local repository connection
+            thread_repo.conn.close()
             
             # Remove from futures tracking
             self._training_futures.pop(node_id, None)
+            
+            logger.debug(f"Training completed for node '{node_id}'")

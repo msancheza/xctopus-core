@@ -285,7 +285,7 @@ def setup_logging(
     logger.info("Logging system configured")
     logger.debug(f"FileHandler: {_log_file} (level {_log_level_file})")
     logger.debug(f"ConsoleHandler: stdout (level {_log_level_console})")
-    logger.debug("Error deduplication and stderr interception enabled")
+    logger.debug("Message deduplication filter and stderr interception enabled")
 
 
 def get_logger(name: str) -> logging.Logger:

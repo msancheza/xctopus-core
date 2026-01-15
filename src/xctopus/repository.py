@@ -8,6 +8,7 @@ Stores FP16 tensors as BLOBs for efficiency.
 import sqlite3
 import io
 import functools
+import time
 from collections import OrderedDict
 import numpy as np
 import torch
@@ -48,7 +49,12 @@ class KNRepository:
             db_path: Path to SQLite database (default: from settings)
         """
         self.db_path = db_path or DB_PATH
-        self.conn = sqlite3.connect(self.db_path)
+        # Enable thread-safe access: WAL mode allows concurrent reads/writes from different threads
+        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        # CRITICAL: Set busy_timeout to handle concurrent writes gracefully (2025-01-14)
+        # This makes SQLite wait up to 5 seconds before raising "database is locked"
+        # This is more efficient than manual retries and handles transient locks automatically
+        self.conn.execute('PRAGMA busy_timeout = 5000')  # 5 seconds timeout
         self.conn.row_factory = sqlite3.Row  # To access columns by name
         self._update_counter = 0  # For batch commits
         
@@ -169,6 +175,44 @@ class KNRepository:
             # Column already exists, not an error
             pass
         
+        # ========================================================================
+        # Deferred Training Support (2025-01-14)
+        # ========================================================================
+        # Migration: Add needs_training column for deferred training
+        try:
+            cursor.execute('ALTER TABLE nodes ADD COLUMN needs_training INTEGER DEFAULT 0')
+            logger.debug("needs_training column added (migration deferred training)")
+        except sqlite3.OperationalError:
+            # Column already exists, not an error
+            pass
+        
+        # Migration: Add last_training_mass for Training Delta (re-training when mass doubles)
+        try:
+            cursor.execute('ALTER TABLE nodes ADD COLUMN last_training_mass INTEGER DEFAULT 0')
+            logger.debug("last_training_mass column added (migration Training Delta)")
+        except sqlite3.OperationalError:
+            # Column already exists, not an error
+            pass
+
+        # ========================================================================
+        # Adaptive Training Support (2026-01-14)
+        # ========================================================================
+        # Migration: Add estimated_epochs for adaptive epoch calculation
+        try:
+            cursor.execute('ALTER TABLE nodes ADD COLUMN estimated_epochs INTEGER')
+            logger.debug("estimated_epochs column added (migration adaptive training)")
+        except sqlite3.OperationalError:
+            # Column already exists, not an error
+            pass
+
+        # Migration: Add training_priority for training order optimization
+        try:
+            cursor.execute('ALTER TABLE nodes ADD COLUMN training_priority REAL')
+            logger.debug("training_priority column added (migration adaptive training)")
+        except sqlite3.OperationalError:
+            # Column already exists, not an error
+            pass
+
         # 5. Node Data Mapping Table (Pointers to original dataset)
         # Purpose: Associate node_id with source_id (pointer to original dataset)
         # This enables training by retrieving original texts from datasets
@@ -457,27 +501,53 @@ class KNRepository:
         # Serialize config to JSON string
         config_json = json.dumps(config) if config else None
 
-        try:
-            cursor = self.conn.cursor()
-            cursor.execute(
-                """UPDATE nodes SET 
-                    peft_weights = ?,
-                    peft_format = ?,
-                    peft_size = ?,
-                    peft_checksum = ?,
-                    peft_config = ?,
-                    peft_trained_timestamp = CURRENT_TIMESTAMP
-                WHERE node_id = ?""",
-                (weights_bytes, format, weights_size, checksum, config_json, node_id)
-            )
-            if cursor.rowcount == 0:
-                logger.warning(f"Attempt to save PEFT weights for non-existent node: {node_id}")
-                return
-            self._maybe_commit()
-            logger.debug(f"PEFT weights saved for {node_id} (format={format}, size={weights_size} bytes)")
-        except sqlite3.Error as e:
-            logger.error(f"SQLite error saving PEFT weights for {node_id}: {e}")
-            raise
+        # ========================================================================
+        # CRITICAL: Retry logic for database locks (2025-01-14)
+        # ========================================================================
+        # SQLite with WAL mode can have temporary locks when multiple threads
+        # write simultaneously, especially with large BLOBs. Retry with backoff.
+        # ========================================================================
+        max_retries = 5
+        retry_delay = 0.1  # Start with 100ms
+        
+        for attempt in range(max_retries):
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute(
+                    """UPDATE nodes SET 
+                        peft_weights = ?,
+                        peft_format = ?,
+                        peft_size = ?,
+                        peft_checksum = ?,
+                        peft_config = ?,
+                        peft_trained_timestamp = CURRENT_TIMESTAMP
+                    WHERE node_id = ?""",
+                    (weights_bytes, format, weights_size, checksum, config_json, node_id)
+                )
+                if cursor.rowcount == 0:
+                    logger.warning(f"Attempt to save PEFT weights for non-existent node: {node_id}")
+                    return
+                self._maybe_commit()
+                logger.debug(f"PEFT weights saved for {node_id} (format={format}, size={weights_size} bytes)")
+                return  # Success
+            except sqlite3.OperationalError as e:
+                if "database is locked" in str(e).lower() and attempt < max_retries - 1:
+                    # Retry with exponential backoff
+                    wait_time = retry_delay * (2 ** attempt)
+                    logger.debug(
+                        f"Database locked when saving PEFT weights for {node_id}, "
+                        f"retrying in {wait_time:.2f}s (attempt {attempt + 1}/{max_retries})"
+                    )
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    # Either not a lock error or max retries reached
+                    logger.error(f"SQLite error saving PEFT weights for {node_id}: {e}")
+                    raise
+            except sqlite3.Error as e:
+                # Other SQLite errors - don't retry
+                logger.error(f"SQLite error saving PEFT weights for {node_id}: {e}")
+                raise
 
     def _load_lora_weights(self, node_id: str) -> Optional[Dict[str, Any]]:
         """Internal helper to load LoRA weights from DB and return a state_dict.
@@ -617,22 +687,48 @@ class KNRepository:
                 f"Must be one of {valid_statuses} or None"
             )
         
-        try:
-            cursor = self.conn.cursor()
-            cursor.execute(
-                "UPDATE nodes SET peft_training_status = ? WHERE node_id = ?",
-                (status, node_id)
-            )
-            
-            if cursor.rowcount == 0:
-                logger.warning(f"Attempt to set training status for non-existent node: {node_id}")
-                return
-            
-            self._maybe_commit()
-            logger.debug(f"Training status set for {node_id}: {status}")
-        except sqlite3.Error as e:
-            logger.error(f"SQLite error setting training status for {node_id}: {e}")
-            raise
+        # ========================================================================
+        # CRITICAL: Retry logic for database locks (2025-01-14)
+        # ========================================================================
+        # SQLite with WAL mode can have temporary locks when multiple threads
+        # write simultaneously. Retry with backoff.
+        # ========================================================================
+        max_retries = 5
+        retry_delay = 0.1  # Start with 100ms
+        
+        for attempt in range(max_retries):
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute(
+                    "UPDATE nodes SET peft_training_status = ? WHERE node_id = ?",
+                    (status, node_id)
+                )
+                
+                if cursor.rowcount == 0:
+                    logger.warning(f"Attempt to set training status for non-existent node: {node_id}")
+                    return
+                
+                self._maybe_commit()
+                logger.debug(f"Training status set for {node_id}: {status}")
+                return  # Success
+            except sqlite3.OperationalError as e:
+                if "database is locked" in str(e).lower() and attempt < max_retries - 1:
+                    # Retry with exponential backoff
+                    wait_time = retry_delay * (2 ** attempt)
+                    logger.debug(
+                        f"Database locked when setting training status for {node_id}, "
+                        f"retrying in {wait_time:.2f}s (attempt {attempt + 1}/{max_retries})"
+                    )
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    # Either not a lock error or max retries reached
+                    logger.error(f"SQLite error setting training status for {node_id}: {e}")
+                    raise
+            except sqlite3.Error as e:
+                # Other SQLite errors - don't retry
+                logger.error(f"SQLite error setting training status for {node_id}: {e}")
+                raise
 
     def get_peft_training_status(self, node_id: str) -> Optional[str]:
         """
@@ -799,22 +895,296 @@ class KNRepository:
         if not signature:
             raise ValueError(f"KN {node_id} does not exist. Create signature first.")
         
-        try:
-            cursor = self.conn.cursor()
-            cursor.execute(
-                "UPDATE nodes SET is_trained = 1 WHERE node_id = ?",
-                (node_id,)
-            )
-            
-            if cursor.rowcount == 0:
-                logger.warning(f"Attempt to mark non-existent node as trained: {node_id}")
+        # ========================================================================
+        # CRITICAL: Retry logic for database locks (2025-01-14)
+        # ========================================================================
+        # SQLite with WAL mode can have temporary locks when multiple threads
+        # write simultaneously. Retry with backoff.
+        # ========================================================================
+        max_retries = 5
+        retry_delay = 0.1  # Start with 100ms
+        
+        for attempt in range(max_retries):
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute(
+                    "UPDATE nodes SET is_trained = 1 WHERE node_id = ?",
+                    (node_id,)
+                )
+                
+                if cursor.rowcount == 0:
+                    logger.warning(f"Attempt to mark non-existent node as trained: {node_id}")
+                    return
+                
+                self._maybe_commit()
+                logger.debug(f"Node marked as trained: {node_id}")
+                return  # Success
+            except sqlite3.OperationalError as e:
+                if "database is locked" in str(e).lower() and attempt < max_retries - 1:
+                    # Retry with exponential backoff
+                    wait_time = retry_delay * (2 ** attempt)
+                    logger.debug(
+                        f"Database locked when marking node as trained {node_id}, "
+                        f"retrying in {wait_time:.2f}s (attempt {attempt + 1}/{max_retries})"
+                    )
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    # Either not a lock error or max retries reached
+                    logger.error(f"SQLite error marking node as trained {node_id}: {e}")
+                    raise
+            except sqlite3.Error as e:
+                # Other SQLite errors - don't retry
+                logger.error(f"SQLite error marking node as trained {node_id}: {e}")
+                raise
+    
+    # --- Deferred Training Support (2025-01-14) ---
+    
+    def mark_for_training(self, node_id: str, is_retraining: bool = False) -> None:
+        """
+        Mark a node as needing training (deferred training).
+        
+        Added: 2025-01-14
+        Purpose: Instead of starting training immediately, mark node for later training.
+        This allows processing to continue without blocking.
+        
+        Args:
+            node_id: Knowledge Node ID to mark
+            is_retraining: If True, this is a re-training (Training Delta)
+        """
+        max_retries = 5
+        retry_delay = 0.1
+        
+        for attempt in range(max_retries):
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute(
+                    "UPDATE nodes SET needs_training = 1 WHERE node_id = ?",
+                    (node_id,)
+                )
+                
+                if cursor.rowcount == 0:
+                    logger.warning(f"Attempt to mark non-existent node for training: {node_id}")
+                    return
+                
+                self._maybe_commit()
+                retraining_str = " (re-training)" if is_retraining else ""
+                logger.debug(f"Node marked for training{retraining_str}: {node_id}")
                 return
-            
-            self._maybe_commit()
-            logger.debug(f"Node marked as trained: {node_id}")
-        except sqlite3.Error as e:
-            logger.error(f"SQLite error marking node as trained {node_id}: {e}")
-            raise
+            except sqlite3.OperationalError as e:
+                if "database is locked" in str(e).lower() and attempt < max_retries - 1:
+                    wait_time = retry_delay * (2 ** attempt)
+                    logger.debug(
+                        f"Database locked when marking node for training {node_id}, "
+                        f"retrying in {wait_time:.2f}s (attempt {attempt + 1}/{max_retries})"
+                    )
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    logger.error(f"SQLite error marking node for training {node_id}: {e}")
+                    raise
+            except sqlite3.Error as e:
+                logger.error(f"SQLite error marking node for training {node_id}: {e}")
+                raise
+    
+    def get_pending_training_nodes(self) -> List[str]:
+        """
+        Get all node IDs that need training.
+        
+        Added: 2025-01-14
+        Purpose: Retrieve list of nodes marked for deferred training.
+        
+        Returns:
+            List of node IDs that have needs_training = 1
+        """
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "SELECT node_id FROM nodes WHERE needs_training = 1 ORDER BY mass DESC"
+        )
+        rows = cursor.fetchall()
+        return [row["node_id"] for row in rows]
+    
+    def clear_training_flag(self, node_id: str) -> None:
+        """
+        Clear needs_training flag after training completes.
+        
+        Added: 2025-01-14
+        Purpose: Reset the flag after training is done.
+        
+        Args:
+            node_id: Knowledge Node ID
+        """
+        max_retries = 5
+        retry_delay = 0.1
+        
+        for attempt in range(max_retries):
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute(
+                    "UPDATE nodes SET needs_training = 0 WHERE node_id = ?",
+                    (node_id,)
+                )
+                self._maybe_commit()
+                logger.debug(f"Training flag cleared for node: {node_id}")
+                return
+            except sqlite3.OperationalError as e:
+                if "database is locked" in str(e).lower() and attempt < max_retries - 1:
+                    wait_time = retry_delay * (2 ** attempt)
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    logger.error(f"SQLite error clearing training flag {node_id}: {e}")
+                    raise
+            except sqlite3.Error as e:
+                logger.error(f"SQLite error clearing training flag {node_id}: {e}")
+                raise
+    
+    def get_last_training_mass(self, node_id: str) -> int:
+        """
+        Get the mass at which node was last trained (for Training Delta).
+        
+        Added: 2025-01-14
+        Purpose: Track mass at last training to enable re-training when mass doubles.
+        
+        Args:
+            node_id: Knowledge Node ID
+        
+        Returns:
+            Mass at last training, or 0 if never trained
+        """
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "SELECT last_training_mass FROM nodes WHERE node_id = ?",
+            (node_id,)
+        )
+        row = cursor.fetchone()
+        
+        if not row:
+            return 0
+        
+        return row["last_training_mass"] or 0
+    
+    def update_last_training_mass(self, node_id: str, mass: int) -> None:
+        """
+        Update last_training_mass after training completes.
+        
+        Added: 2025-01-14
+        Purpose: Store mass at which training occurred for Training Delta calculation.
+        
+        Args:
+            node_id: Knowledge Node ID
+            mass: Current mass of the node
+        """
+        max_retries = 5
+        retry_delay = 0.1
+        
+        for attempt in range(max_retries):
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute(
+                    "UPDATE nodes SET last_training_mass = ? WHERE node_id = ?",
+                    (mass, node_id)
+                )
+                self._maybe_commit()
+                logger.debug(f"Last training mass updated for node {node_id}: {mass}")
+                return
+            except sqlite3.OperationalError as e:
+                if "database is locked" in str(e).lower() and attempt < max_retries - 1:
+                    wait_time = retry_delay * (2 ** attempt)
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    logger.error(f"SQLite error updating last training mass {node_id}: {e}")
+                    raise
+            except sqlite3.Error as e:
+                logger.error(f"SQLite error updating last training mass {node_id}: {e}")
+                raise
+    
+    def get_estimated_epochs(self, node_id: str) -> Optional[int]:
+        """
+        Get estimated epochs for a node.
+        
+        Added: 2026-01-14
+        Purpose: Retrieve calculated estimated_epochs for training.
+        
+        Args:
+            node_id: Knowledge Node ID
+        
+        Returns:
+            Estimated epochs, or None if not set
+        """
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "SELECT estimated_epochs FROM nodes WHERE node_id = ?",
+            (node_id,)
+        )
+        row = cursor.fetchone()
+        
+        if row and row["estimated_epochs"] is not None:
+            return int(row["estimated_epochs"])
+        return None
+    
+    def update_training_metadata(
+        self, 
+        node_id: str, 
+        estimated_epochs: Optional[int] = None, 
+        training_priority: Optional[float] = None
+    ) -> None:
+        """
+        Update training metadata (estimated_epochs and training_priority) for a node.
+        
+        Added: 2026-01-14
+        Purpose: Store calculated training metadata after fusion.
+        
+        Args:
+            node_id: Knowledge Node ID
+            estimated_epochs: Estimated number of epochs for training (optional)
+            training_priority: Training priority based on information density (optional)
+        """
+        max_retries = 5
+        retry_delay = 0.1
+        
+        # Build UPDATE query dynamically based on provided values
+        updates = []
+        values = []
+        
+        if estimated_epochs is not None:
+            updates.append("estimated_epochs = ?")
+            values.append(estimated_epochs)
+        
+        if training_priority is not None:
+            updates.append("training_priority = ?")
+            values.append(training_priority)
+        
+        if not updates:
+            # Nothing to update
+            return
+        
+        values.append(node_id)  # For WHERE clause
+        
+        query = f"UPDATE nodes SET {', '.join(updates)} WHERE node_id = ?"
+        
+        for attempt in range(max_retries):
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute(query, values)
+                self._maybe_commit()
+                logger.debug(
+                    f"Training metadata updated for node {node_id}: "
+                    f"epochs={estimated_epochs}, priority={training_priority}"
+                )
+                return
+            except sqlite3.OperationalError as e:
+                if "database is locked" in str(e).lower() and attempt < max_retries - 1:
+                    wait_time = retry_delay * (2 ** attempt)
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    logger.error(f"SQLite error updating training metadata {node_id}: {e}")
+                    raise
+            except sqlite3.Error as e:
+                logger.error(f"SQLite error updating training metadata {node_id}: {e}")
+                raise
 
     # --- Physical Memory Management (Embeddings) ---
     

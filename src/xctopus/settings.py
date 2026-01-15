@@ -28,10 +28,20 @@ else:
 # Similarity and Routing Parameters (FilterBayesianNode)
 # ============================================================================
 
-S_MIN = 0.65  # Minimum Cosine Similarity to accept an embedding in a KN.
+S_MIN = 0.60  # Minimum Cosine Similarity to accept an embedding in a KN.
+               # Adjusted: 0.60 (was 0.65) to allow more embeddings to be assigned to existing nodes
                # Note: In MiniLM, 0.60-0.65 already indicates strong thematic relationship.
                # Higher values (0.75+) are too restrictive for diverse datasets.
-LAMBDA_FACTOR = 0.1  # "Critical Mass" strength. Higher values mean larger nodes have more attraction.
+LAMBDA_FACTOR = 0.2  # "Critical Mass" strength. Higher values mean larger nodes have more attraction.
+                      # Adjusted: 0.2 (was 0.1) to increase gravitational pull of existing nodes
+THRESH_DECAY = 0.15  # Dynamic threshold decay factor for FilterBayesian
+                      # Formula: dynamic_threshold = S_MIN - (THRESH_DECAY / log1p(mass))
+                      # Higher values = more permissive for small nodes
+                      # Lower values = stricter even for small nodes
+                      # Range: 0.10-0.20 recommended
+THRESH_MIN_LOG = 0.1  # Minimum value for log1p(mass) in dynamic threshold calculation
+                       # Prevents division by zero and ensures numerical stability
+                       # Should be > 0 and < log1p(1) ≈ 0.69
 
 # ============================================================================
 # Data Structure Parameters
@@ -53,20 +63,45 @@ SAVE_BATCH_SIZE = 10  # How many updates before committing to SQLite to avoid bl
 # Orchestrator Parameters
 # ============================================================================
 
-REFRESH_INTERVAL = 10  # How many processed embeddings before refreshing FilterBayesian signatures
+# REFRESH_INTERVAL = 10  # DEPRECATED: No longer used
+#                         # FilterBayesian signatures are now updated immediately after each
+#                         # embedding is accepted (see orchestrator.py _process_kn_update)
+#                         # This ensures centroids evolve in real-time for better routing decisions
 
 # ============================================================================
 # Phase 2: Training Parameters
 # ============================================================================
 
-TRAINING_THRESHOLD = 20  # Minimum mass (number of embeddings) to trigger training
+TRAINING_THRESHOLD = 10  # Minimum mass (number of embeddings) to trigger training
                          # When a KnowledgeNode reaches this mass, it will be queued for training
-                         # Range: 20-50 for testing/development, 50-100 for production
+                         # Adjusted: 10 (was 20) based on actual node mass distribution (avg ~6)
                          # Lower values = faster training triggers, but less stable gradients
-MAX_CONCURRENT_TRAINING = 2  # Maximum concurrent training tasks (limited by ThreadPoolExecutor)
-MIN_TRAINING_TEXTS = 10  # Minimum number of texts required for stable training
-                          # Too few texts (e.g., < 10) can lead to unstable gradients and overfitting
-                          # This ensures training quality and prevents gradient instability
+                         # Range: 8-15 for testing/development, 15-30 for production
+MAX_CONCURRENT_TRAINING = 1  # Maximum concurrent training tasks (limited by ThreadPoolExecutor)
+                             # CRITICAL: Set to 1 because TransformerBase singleton is not thread-safe for 
+                             # concurrent training (PeftModel modifies the shared base model).
+                             # Future improvement: Use multiple processes or separate model instances.
+MIN_TRAINING_TEXTS = 6  # Minimum number of texts required for stable training
+                         # Adjusted: 6 (was 10) to match realistic node sizes
+                         # Too few texts (e.g., < 5) can lead to unstable gradients and overfitting
+                         # This ensures training quality and prevents gradient instability
+
+# ============================================================================
+# Deferred Training Parameters (Training Delta)
+# ============================================================================
+
+TRAINING_DELTA_MULTIPLIER = 2.0  # Re-train when mass doubles (10→20→40→80...)
+                                  # Set to 0.0 to disable re-training based on mass doubling
+                                  # This enables incremental learning without saturating GPU
+
+TRAINING_DELTA_TIMEOUT_DAYS = 30  # Re-train if last training was > 30 days ago
+                                   # Set to 0 to disable timeout-based re-training
+                                   # Ensures nodes are updated even if they grow slowly
+
+MAX_TRAINING_TEXTS = 100  # Maximum number of texts to use for training
+                          # If node has more, use last N texts (most recent)
+                          # Set to 0 for no limit (use all available)
+                          # Prevents training from being too slow with very large nodes
 
 # ============================================================================
 # Knowledge Nodes Fusion Parameters

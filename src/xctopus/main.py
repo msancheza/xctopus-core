@@ -169,7 +169,7 @@ def initialize_components(
     # Warmup: Load existing signatures once
     # ========================================================================
     # This avoids refreshing on each iteration of the main loop.
-    # Orchestrator will handle intelligent refreshes (every REFRESH_INTERVAL).
+    # Orchestrator will handle immediate signature updates after each embedding is accepted.
     signatures = repository.get_all_signatures()
     filter_bayesian.refresh_signatures(signatures)
     logger.debug(f"FilterBayesian initialized with {len(signatures)} signatures (warmup)")
@@ -200,7 +200,7 @@ def process_dataset(
     Flow for each embedding:
     1. Routing: FilterBayesian decides route (uses in-memory signatures)
     2. Execution: Orchestrator executes decision
-       - Intelligent refreshes every REFRESH_INTERVAL
+       - Immediate signature updates after each embedding is accepted
     3. Batch commits: Periodic commit
     
     OPTIMIZED: Signatures are loaded once at startup (warmup).
@@ -248,10 +248,14 @@ def process_dataset(
             
             # Update postfix with KN and Buffer counts
             counts = orchestrator.get_counts()
-            embeddings_iter.set_postfix({
+            postfix_dict = {
                 "KNs": counts["kn_count"],
                 "Buffers": counts["buffer_count"]
-            })
+            }
+            # Add "T" if training is active (simple indicator, no RAM overhead)
+            if orchestrator.has_active_training():
+                postfix_dict["T"] = "T"
+            embeddings_iter.set_postfix(postfix_dict)
             
             # Periodic logging (DEBUG level to avoid console spam)
             if (i + 1) % progress_interval == 0:
@@ -282,10 +286,11 @@ def process_dataset(
                 
                 # Update progress with KN and Buffer info
                 counts = orchestrator.get_counts()
+                training_indicator = " T" if orchestrator.has_active_training() else ""
                 progress.update(
                     task,
                     advance=1,
-                    description=f"[cyan]Processing embeddings... [dim]KNs: {counts['kn_count']}, Buffers: {counts['buffer_count']}[/dim]"
+                    description=f"[cyan]Processing embeddings... [dim]KNs: {counts['kn_count']}, Buffers: {counts['buffer_count']}{training_indicator}[/dim]"
                 )
                 
                 # Periodic logging (DEBUG level to avoid console spam)
@@ -327,7 +332,7 @@ def _process_single_embedding(
     
     OPTIMIZED: Doesn't refresh signatures on each iteration.
     - Signatures are loaded once in initialize_components() (warmup)
-    - Orchestrator handles intelligent refreshes (every REFRESH_INTERVAL)
+    - Orchestrator handles immediate signature updates after each embedding is accepted
     - This avoids 18,233 unnecessary SQL queries
     
     Phase 2: Accepts source_id for data provenance (pointer to original dataset).
@@ -389,22 +394,27 @@ def finalize(
     
     # Show summary with rich
     if RICH_AVAILABLE and console:
-        _show_summary_rich(signatures, active_nodes_count)
+        _show_summary_rich(signatures, active_nodes_count, repository)
     else:
-        _show_summary_simple(signatures, active_nodes_count)
+        _show_summary_simple(signatures, active_nodes_count, repository)
     
     logger.info("Processing finalized correctly")
 
 
-def _show_summary_rich(signatures: List[dict], active_nodes_count: int) -> None:
+def _show_summary_rich(signatures: List[dict], active_nodes_count: int, repository: KNRepository) -> None:
     """
     Show final summary using rich (well-formatted tables).
     
     Args:
         signatures: List of KnowledgeNode signatures
         active_nodes_count: Number of active nodes
+        repository: KNRepository instance to check training status
     """
     console.print("\n[bold cyan]📊 Processing Summary[/bold cyan]\n")
+    
+    # Calculate training statistics
+    trained_nodes = sum(1 for sig in signatures if repository.is_trained(sig["node_id"]))
+    candidates_potential = sum(1 for sig in signatures if sig["mass"] > 5)
     
     # General statistics table
     stats_table = Table(title="General Statistics", show_header=True, header_style="bold magenta")
@@ -422,6 +432,17 @@ def _show_summary_rich(signatures: List[dict], active_nodes_count: int) -> None:
     stats_table.add_row("Average Variance", f"{avg_variance:.4f}")
     
     console.print(stats_table)
+    
+    # Training statistics table
+    training_table = Table(title="Training Status", show_header=True, header_style="bold yellow")
+    training_table.add_column("Métrica", style="cyan")
+    training_table.add_column("Valor", style="green", justify="right")
+    
+    training_table.add_row("Nodos Entrenados", str(trained_nodes))
+    training_table.add_row("Candidatos Potenciales (masa > 5)", str(candidates_potential))
+    
+    console.print("\n")
+    console.print(training_table)
     
     # Tabla de KnowledgeNodes (top 10 por masa)
     if signatures:
@@ -447,14 +468,24 @@ def _show_summary_rich(signatures: List[dict], active_nodes_count: int) -> None:
     console.print()
 
 
-def _show_summary_simple(signatures: List[dict], active_nodes_count: int) -> None:
+def _show_summary_simple(signatures: List[dict], active_nodes_count: int, repository: KNRepository) -> None:
     """
     Shows final summary in simple format (without rich).
     
     Args:
         signatures: List of KnowledgeNode signatures
         active_nodes_count: Number of active nodes
+        repository: KNRepository instance to check training status
     """
+    logger.info("=" * 60)
+    
+    # Calculate training statistics
+    trained_nodes = sum(1 for sig in signatures if repository.is_trained(sig["node_id"]))
+    candidates_potential = sum(1 for sig in signatures if sig["mass"] > 5)
+    
+    logger.info("📊 Análisis de Fin de Jornada:")
+    logger.info(f"   Nodos entrenados: {trained_nodes}")
+    logger.info(f"   Candidatos potenciales con masa > 5: {candidates_potential}")
     logger.info("=" * 60)
     logger.info("PROCESSING SUMMARY")
     logger.info("=" * 60)
@@ -488,8 +519,10 @@ def main(dataset_path: str) -> None:
     Complete flow:
     1. Load embeddings from dataset
     2. Initialize components
-    3. Process dataset
-    4. Finalize and show summary
+    3. Process dataset (Layer 1: Clustering)
+    4. Fuse Knowledge Nodes (post-clustering)
+    5. Run deferred training (Layer 2: Specialization)
+    6. Finalize and show summary
     
     Args:
         dataset_path: Path to dataset file
@@ -516,7 +549,17 @@ def main(dataset_path: str) -> None:
             f"{fusion_stats['initial_kns']} -> {fusion_stats['final_kns']} KNs"
         )
         
-        # 5. Finalize
+        # 5. Run deferred training (Layer 2: Specialization)
+        logger.info("=" * 60)
+        logger.info("Starting deferred training phase...")
+        logger.info("=" * 60)
+        training_stats = orchestrator.run_deferred_training()
+        logger.info(
+            f"Training completed: {training_stats['trained']} nodes trained, "
+            f"{training_stats['failed']} failed (out of {training_stats['total_pending']} pending)"
+        )
+        
+        # 6. Finalize
         finalize(repository, orchestrator)
         
         logger.info("Process completed successfully")

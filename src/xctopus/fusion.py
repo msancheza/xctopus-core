@@ -30,6 +30,7 @@ from .repository import KNRepository
 from .orchestrator import Orchestrator
 from .knowledgenode import KnowledgeNode
 from .settings import (
+    TRAINING_THRESHOLD,
     DEVICE,
     DTYPE,
     EMBEDDING_DIM,
@@ -160,6 +161,7 @@ def fuse_knowledge_nodes(
     repository: KNRepository,
     orchestrator: Orchestrator,
     progress_interval: int = 10,
+    calculate_metadata: bool = True,
 ) -> Dict[str, int]:
     """
     Execute Knowledge Nodes fusion protocol.
@@ -170,18 +172,21 @@ def fuse_knowledge_nodes(
     3. Simulate variance after fusion
     4. Execute valid fusions
     5. Re-assign orphan buffers
+    6. Calculate training metadata (optional)
     
     Args:
         repository: KNRepository instance
         orchestrator: Orchestrator instance
         progress_interval: How many fusions before showing progress (default: 10)
+        calculate_metadata: If True, calculate training metadata after fusion (default: True)
     
     Returns:
         Dict with statistics: {
             'initial_kns': int,
             'final_kns': int,
             'fusions_performed': int,
-            'buffers_reassigned': int
+            'buffers_reassigned': int,
+            'metadata_updated': int (if calculate_metadata=True)
         }
     """
     logger.info("=" * 60)
@@ -242,6 +247,41 @@ def fuse_knowledge_nodes(
         progress_interval=progress_interval
     )
     
+    # ========================================================================
+    # Post-Fusion: Marcar nodos que alcancen threshold (2025-01-14)
+    # ========================================================================
+    # Después de fusionar, algunos nodos pueden haber alcanzado masa >= 10
+    # Necesitamos marcarlos para training si no están ya marcados
+    # Esto evita entrenar nodos que se fusionarán después
+    # ========================================================================
+    logger.info("Post-fusion: Checking for nodes that reached training threshold...")
+    final_signatures_after_fusion = repository.get_all_signatures()
+    
+    nodes_marked_post_fusion = 0
+    for sig in final_signatures_after_fusion:
+        node_id = sig['node_id']
+        mass = sig['mass']
+        
+        # Si masa >= threshold y no está entrenado y no está ya marcado
+        if mass >= TRAINING_THRESHOLD:
+            if not repository.is_trained(node_id):
+                pending = repository.get_pending_training_nodes()
+                if node_id not in pending:
+                    repository.mark_for_training(node_id, is_retraining=False)
+                    nodes_marked_post_fusion += 1
+                    logger.debug(
+                        f"Node '{node_id}' marked for training post-fusion "
+                        f"(mass={mass} >= {TRAINING_THRESHOLD})"
+                    )
+    
+    if nodes_marked_post_fusion > 0:
+        logger.info(
+            f"Post-fusion: {nodes_marked_post_fusion} nodes marked for training "
+            f"(reached threshold after fusion)"
+        )
+    else:
+        logger.debug("Post-fusion: No additional nodes needed marking for training")
+    
     # Phase 4: Re-assign orphan buffers
     logger.info("Phase 4: Re-assigning orphan buffers...")
     buffers_reassigned = _reassign_orphan_buffers(
@@ -249,6 +289,27 @@ def fuse_knowledge_nodes(
         orchestrator,
         in_notebook=in_notebook
     )
+    
+    # Phase 5: Calculate training metadata (optional)
+    metadata_updated = 0
+    if calculate_metadata:
+        logger.info("Phase 5: Calculating training metadata...")
+        try:
+            metadata_stats = _calculate_training_metadata(repository, orchestrator)
+            metadata_updated = metadata_stats.get('updated', 0)
+            logger.info(
+                f"Training metadata calculated: {metadata_updated} nodes updated "
+                f"(avg_epochs={metadata_stats.get('avg_epochs', 0):.2f}, "
+                f"range={metadata_stats.get('min_epochs', 0)}-{metadata_stats.get('max_epochs', 0)})"
+            )
+        except Exception as e:
+            logger.warning(
+                f"Error calculating training metadata: {e}. "
+                f"Fusion completed successfully, but metadata calculation failed.",
+                exc_info=True
+            )
+            # Don't fail fusion if metadata calculation fails
+            metadata_updated = 0
     
     # Final statistics
     final_signatures = repository.get_all_signatures()
@@ -260,15 +321,22 @@ def fuse_knowledge_nodes(
     logger.info(f"Final KNs: {final_kns_count}")
     logger.info(f"Fusions performed: {fusions_performed}")
     logger.info(f"Buffers reassigned: {buffers_reassigned}")
+    if calculate_metadata:
+        logger.info(f"Metadata updated: {metadata_updated}")
     logger.info(f"Reduction: {initial_kns_count - final_kns_count} KNs ({((initial_kns_count - final_kns_count) / initial_kns_count * 100):.1f}%)")
     logger.info("=" * 60)
     
-    return {
+    result = {
         'initial_kns': initial_kns_count,
         'final_kns': final_kns_count,
         'fusions_performed': fusions_performed,
         'buffers_reassigned': buffers_reassigned
     }
+    
+    if calculate_metadata:
+        result['metadata_updated'] = metadata_updated
+    
+    return result
 
 
 def _calculate_semantic_adjacency_matrix(
@@ -745,6 +813,53 @@ def _merge_two_kns(
         for emb in all_embeddings:
             repository.add_embedding_to_memory(merged_node_id, emb)
     
+    # ========================================================================
+    # Herencia de Estado para Deferred Training (2025-01-14)
+    # ========================================================================
+    # Aplicar reglas de herencia antes de eliminar nodos originales:
+    # 1. Si alguno tenía needs_training, el fusionado también
+    # 2. Si alguno estaba entrenado, marcar para re-entrenamiento
+    # 3. Si masa >= TRAINING_THRESHOLD, marcar automáticamente
+    # ========================================================================
+    
+    # Verificar flags de nodos originales antes de eliminarlos
+    pending_training_nodes = repository.get_pending_training_nodes()
+    needs_training_1 = node_id_1 in pending_training_nodes
+    needs_training_2 = node_id_2 in pending_training_nodes
+    is_trained_1 = repository.is_trained(node_id_1)
+    is_trained_2 = repository.is_trained(node_id_2)
+    
+    # Regla 1: Herencia de needs_training (si alguno tenía el flag, heredarlo)
+    if needs_training_1 or needs_training_2:
+        repository.mark_for_training(merged_node_id, is_retraining=False)
+        logger.debug(
+            f"Merged node '{merged_node_id}' marked for training "
+            f"(inherited: node1_needs={needs_training_1}, node2_needs={needs_training_2})"
+        )
+    
+    # Regla 2: Re-entrenamiento si alguno estaba entrenado
+    # El centroide cambió (promedio ponderado), el adaptador LoRA es obsoleto
+    if is_trained_1 or is_trained_2:
+        repository.mark_for_training(merged_node_id, is_retraining=True)
+        logger.debug(
+            f"Merged node '{merged_node_id}' marked for re-training "
+            f"(one of original nodes was trained: node1_trained={is_trained_1}, "
+            f"node2_trained={is_trained_2}, centroid changed)"
+        )
+    
+    # Regla 3: Marcar automáticamente si masa >= TRAINING_THRESHOLD
+    # (solo si no está ya marcado y no está entrenado)
+    if total_mass >= TRAINING_THRESHOLD:
+        if not repository.is_trained(merged_node_id):
+            # Verificar si ya está marcado (evitar duplicados)
+            current_pending = repository.get_pending_training_nodes()
+            if merged_node_id not in current_pending:
+                repository.mark_for_training(merged_node_id, is_retraining=False)
+                logger.debug(
+                    f"Merged node '{merged_node_id}' marked for training "
+                    f"(mass={total_mass} >= {TRAINING_THRESHOLD})"
+                )
+    
     # Delete original nodes
     repository.delete_kn(node_id_1)
     repository.delete_kn(node_id_2)
@@ -884,3 +999,196 @@ def _reassign_orphan_buffers(
             progress.stop()
     
     return reassigned
+
+
+def _calculate_training_epochs(mass: int, variance: float, num_texts: Optional[int] = None) -> int:
+    """
+    Calculate estimated number of epochs based on node complexity.
+    
+    Formula: complexity = log1p(mass) * (1 + variance)
+    Epochs = clip(complexity * 0.5, 2, 7)
+    
+    Args:
+        mass: Node mass (number of embeddings)
+        variance: Node variance (semantic dispersion)
+        num_texts: Number of texts for training (optional, for adjustment)
+    
+    Returns:
+        int: Estimated number of epochs (2-7)
+    """
+    # Validate inputs
+    if mass <= 0:
+        logger.warning(f"Invalid mass for epoch calculation: {mass}, using default 2")
+        return 2
+    if variance < 0:
+        logger.warning(f"Invalid variance for epoch calculation: {variance}, using 0")
+        variance = 0.0
+    
+    # Base complexity: logarithmic growth with mass, penalized by variance
+    complexity = np.log1p(mass) * (1 + variance)
+    
+    # Special adjustments
+    if variance == 0:
+        # Perfectly cohesive node: fewer epochs needed
+        complexity *= 0.8
+    elif variance > 1.5:
+        # Very high variance: more epochs needed
+        complexity *= 1.2
+    
+    if mass < 5:
+        # Very small nodes: more epochs to compensate for low volume
+        complexity *= 1.3
+    
+    # Adjust by number of texts if available
+    if num_texts is not None:
+        if num_texts < 20:
+            complexity *= 1.2  # Small datasets: more epochs
+        elif num_texts > 100:
+            complexity *= 0.8  # Large datasets: fewer epochs
+    
+    # Map to epochs (factor 0.5, range 2-7)
+    epochs = int(np.clip(complexity * 0.5, 2, 7))
+    
+    return epochs
+
+
+def _calculate_training_priority(mass: int, variance: float) -> float:
+    """
+    Calculate training priority based on information density.
+    
+    Formula: priority = mass / (1 + variance)
+    Higher mass + lower variance = higher priority (better expert)
+    
+    Args:
+        mass: Node mass (number of embeddings)
+        variance: Node variance (semantic dispersion)
+    
+    Returns:
+        float: Training priority (higher = more important)
+    """
+    if variance < 0:
+        logger.warning(f"Invalid variance for priority calculation: {variance}, using 0")
+        variance = 0.0
+    
+    # Information density: mass / (1 + variance)
+    # +1 prevents division by zero and smooths variance effect
+    priority = mass / (1 + variance)
+    
+    return priority
+
+
+def _calculate_training_metadata(
+    repository: KNRepository,
+    orchestrator: Optional[Orchestrator] = None
+) -> Dict[str, Any]:
+    """
+    Calculate estimated_epochs and training_priority for nodes that need training.
+    
+    This function is called after fusion to ensure all nodes have updated metadata.
+    It analyzes nodes with needs_training=1 and calculates:
+    - estimated_epochs: Based on complexity (mass, variance, num_texts)
+    - training_priority: Based on information density (mass / (1 + variance))
+    
+    Args:
+        repository: KNRepository instance
+        orchestrator: Optional Orchestrator (for accessing active_nodes if needed)
+    
+    Returns:
+        dict: Statistics about metadata calculation {
+            'total': int,
+            'updated': int,
+            'errors': int,
+            'avg_epochs': float,
+            'min_epochs': int,
+            'max_epochs': int
+        }
+    """
+    try:
+        # Get nodes that need training
+        cursor = repository.conn.cursor()
+        cursor.execute("""
+            SELECT 
+                n.node_id, 
+                n.mass, 
+                n.variance,
+                COUNT(ndm.source_id) as num_texts
+            FROM nodes n
+            LEFT JOIN node_data_mapping ndm ON n.node_id = ndm.node_id
+            WHERE n.needs_training = 1 
+            AND n.mass > 0 
+            AND n.variance IS NOT NULL
+            GROUP BY n.node_id, n.mass, n.variance
+        """)
+        rows = cursor.fetchall()
+        
+        if not rows:
+            logger.debug("No nodes marked for training, skipping metadata calculation")
+            return {
+                'total': 0,
+                'updated': 0,
+                'errors': 0,
+                'avg_epochs': 0.0,
+                'min_epochs': 0,
+                'max_epochs': 0
+            }
+        
+        updated_count = 0
+        error_count = 0
+        epochs_list = []
+        
+        for row in rows:
+            node_id = row["node_id"]
+            mass = row["mass"]
+            variance = row["variance"] or 0.0
+            num_texts = row["num_texts"] or None
+            
+            try:
+                # Calculate epochs and priority
+                epochs = _calculate_training_epochs(mass, variance, num_texts)
+                priority = _calculate_training_priority(mass, variance)
+                
+                # Update in repository
+                repository.update_training_metadata(
+                    node_id=node_id,
+                    estimated_epochs=epochs,
+                    training_priority=priority
+                )
+                
+                updated_count += 1
+                epochs_list.append(epochs)
+                
+                logger.debug(
+                    f"Node {node_id}: mass={mass}, variance={variance:.3f}, "
+                    f"texts={num_texts}, epochs={epochs}, priority={priority:.2f}"
+                )
+                
+            except Exception as e:
+                logger.error(f"Error processing node {node_id} for metadata: {e}")
+                error_count += 1
+                continue
+        
+        # Calculate statistics
+        avg_epochs = np.mean(epochs_list) if epochs_list else 0.0
+        min_epochs = int(min(epochs_list)) if epochs_list else 0
+        max_epochs = int(max(epochs_list)) if epochs_list else 0
+        
+        result = {
+            'total': len(rows),
+            'updated': updated_count,
+            'errors': error_count,
+            'avg_epochs': float(avg_epochs),
+            'min_epochs': min_epochs,
+            'max_epochs': max_epochs
+        }
+        
+        logger.debug(
+            f"Training metadata calculation completed: "
+            f"{updated_count}/{len(rows)} nodes updated, "
+            f"avg_epochs={avg_epochs:.2f}, range={min_epochs}-{max_epochs}"
+        )
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"Error in _calculate_training_metadata: {e}", exc_info=True)
+        raise

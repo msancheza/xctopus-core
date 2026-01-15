@@ -8,12 +8,18 @@ from typing import List, Optional
 from pathlib import Path
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import PeftModel, LoraConfig, get_peft_model, TaskType
-from .settings import LLM_MODEL_ID, LOAD_IN_8BIT, DEVICE, DTYPE, LORA_RANK_DEFAULT, MIN_TRAINING_TEXTS
+from .settings import (
+    LLM_MODEL_ID, LOAD_IN_8BIT, DEVICE, DTYPE, LORA_RANK_DEFAULT, 
+    MIN_TRAINING_TEXTS, MAX_TRAINING_TEXTS
+)
 
 # Suppress transformers deprecation warning about torch.tensor()
 # This is an internal transformers warning, not from our code
 warnings.filterwarnings("ignore", message=".*torch_dtype.*", category=UserWarning)
 warnings.filterwarnings("ignore", message=".*To copy construct from a tensor.*", category=UserWarning)
+# Suppress PEFT warnings (we clean adapters properly by resetting to base model)
+warnings.filterwarnings("ignore", message=".*Already found a `peft_config` attribute.*", category=UserWarning)
+warnings.filterwarnings("ignore", message=".*You are trying to modify a model with PEFT for a second time.*", category=UserWarning)
 
 logger = logging.getLogger(__name__)
 
@@ -92,12 +98,26 @@ class TransformerBase:
         """
         Safely applies LoRA weights to the base model.
         """
-        # 1. Clean previous adapters if they exist
+        # 1. Always reset to base model from singleton to ensure clean state
+        # This avoids PEFT warnings about modifying a model with PEFT for a second time
         if isinstance(self.model, PeftModel):
             logger.debug("Unloading previous adapter...")
-            self.model = self.model.merge_and_unload()
+            try:
+                # Try unload() first (cleaner, doesn't merge weights)
+                if hasattr(self.model, 'unload'):
+                    self.model = self.model.unload()
+                else:
+                    # Fallback to merge_and_unload() if unload() not available
+                    self.model = self.model.merge_and_unload()
+            except Exception as e:
+                logger.debug(f"Error unloading adapter: {e}, resetting to base model")
+                self.model = TransformerBase._base_model
+        
+        # 2. Always use fresh base model from singleton to ensure no residual PEFT state
+        # This is the safest approach to avoid PEFT warnings
+        self.model = TransformerBase._base_model
             
-        # 2. Inject new adapter with strict=False to avoid crashes due to partial keys
+        # 3. Inject new adapter with strict=False to avoid crashes due to partial keys
         if state_dict:
             try:
                 # Note: PeftModel.from_pretrained usually expects a path, not a direct dict.
@@ -230,6 +250,16 @@ class TransformerBase:
             logger.debug(f"train_kn_adapter: texts list is empty for node '{node_id}'")
             return None
         
+        # ========================================================================
+        # Apply MAX_TRAINING_TEXTS limit if configured (2025-01-14)
+        # ========================================================================
+        if MAX_TRAINING_TEXTS > 0 and len(texts) > MAX_TRAINING_TEXTS:
+            logger.debug(
+                f"Node '{node_id}' has {len(texts)} texts, "
+                f"limiting to last {MAX_TRAINING_TEXTS} (most recent)"
+            )
+            texts = texts[-MAX_TRAINING_TEXTS:]  # Use last N texts (most recent)
+        
         # Filter out None/empty texts
         valid_texts = [text for text in texts if text and isinstance(text, str) and text.strip()]
         
@@ -345,16 +375,19 @@ class TransformerBase:
             num_samples = len(valid_texts)
             
             for epoch in range(epochs):
+                logger.debug(f"Node '{node_id}' starting epoch {epoch + 1}/{epochs}")
                 epoch_loss = 0.0
                 num_batches = 0
                 
                 # Process in batches
                 for i in range(0, num_samples, batch_size):
+                    logger.debug(f"Node '{node_id}' epoch {epoch + 1}/{epochs}: processing batch {i // batch_size + 1}")
                     # Get batch
                     batch_input_ids = input_ids[i:i + batch_size]
                     batch_attention_mask = attention_mask[i:i + batch_size]
                     
                     # Forward pass
+                    logger.debug(f"Node '{node_id}' epoch {epoch + 1}/{epochs}: forward pass")
                     optimizer.zero_grad()
                     outputs = peft_model(
                         input_ids=batch_input_ids,
@@ -365,11 +398,13 @@ class TransformerBase:
                     loss = outputs.loss
                     
                     # Backward pass
+                    logger.debug(f"Node '{node_id}' epoch {epoch + 1}/{epochs}: backward pass")
                     loss.backward()
                     optimizer.step()
                     
                     epoch_loss += loss.item()
                     num_batches += 1
+                    logger.debug(f"Node '{node_id}' epoch {epoch + 1}/{epochs}: batch {i // batch_size + 1} completed, loss={loss.item():.4f}")
                 
                 avg_loss = epoch_loss / num_batches if num_batches > 0 else 0.0
                 total_loss += avg_loss
