@@ -56,25 +56,22 @@ class DataManager:
         self, 
         dataset_paths: Optional[Dict[str, str]] = None,
         use_sqlite_index: bool = True,
-        sqlite_index_dir: Optional[str] = None
+        sqlite_index_dir: Optional[str] = None,
+        repository: Optional[Any] = None
     ):
         """
         Initialize DataManager.
         
         Args:
             dataset_paths: Dictionary mapping dataset names to file paths
-                Example: {
-                    'arxiv': '/path/to/arxiv_data.csv',
-                    '20newsgroups': '/path/to/20newsgroups.csv',
-                    '20newsgroups_folders': '/path/to/20newsgroups/',  # Folder format
-                    'arxiv_json': '/path/to/arxiv-metadata-oai-snapshot.json'
-                }
             use_sqlite_index: If True, creates SQLite index for large datasets
             sqlite_index_dir: Directory for SQLite index files (default: same as dataset)
+            repository: Optional KNRepository instance for session resolution
         """
         self.dataset_paths = dataset_paths or {}
         self.use_sqlite_index = use_sqlite_index
         self.sqlite_index_dir = sqlite_index_dir
+        self.repository = repository
         
         # Cache for loaded datasets (lazy loading) - only for small datasets
         # Format: {dataset_name: {source_id: text}}
@@ -583,11 +580,30 @@ class DataManager:
         Returns:
             Dataset name or None if cannot infer
         """
-        # Check if source_id has prefix (e.g., "arxiv:1234.5678")
+        # Check if source_id has prefix (e.g., "arxiv:1234.5678" or "sA9x2:42")
         if ':' in source_id:
             prefix = source_id.split(':', 1)[0]
             if prefix in self.dataset_paths:
                 return prefix
+            
+            # Phase 2 (Session Support): Try to resolve session prefix via Repository
+            if self.repository and hasattr(self.repository, 'get_session_info'):
+                session_info = self.repository.get_session_info(prefix)
+                if session_info:
+                    dataset_name = session_info['dataset_name']
+                    dataset_path = session_info['dataset_path']
+                    
+                    # Register this dataset path dynamically
+                    if dataset_name not in self.dataset_paths:
+                        self.dataset_paths[dataset_name] = dataset_path
+                        logger.info(f"Resolved session-based dataset: {prefix} -> {dataset_name} ({dataset_path})")
+                    
+                    # Also register the prefix itself as a valid dataset name pointing to the same file
+                    # This allows subsequent lookups for the same prefix to be fast
+                    if prefix not in self.dataset_paths:
+                        self.dataset_paths[prefix] = dataset_path
+                    
+                    return dataset_name
         
         # Try to match by checking all datasets
         # This is a fallback - ideally source_id should have prefix
@@ -595,10 +611,22 @@ class DataManager:
             if dataset_name.lower() in source_id.lower():
                 return dataset_name
         
-        # If no match, try first dataset as fallback
+        # If no match and only one dataset available, use it as fallback
+        # This handles cases where source_ids are just numeric indices (e.g., "8293")
+        # and we're processing a single dataset
         if len(self.dataset_paths) == 1:
-            return list(self.dataset_paths.keys())[0]
+            dataset_name = list(self.dataset_paths.keys())[0]
+            logger.debug(
+                f"Cannot infer dataset from source_id '{source_id}', "
+                f"using single available dataset '{dataset_name}' as fallback"
+            )
+            return dataset_name
         
+        # Multiple datasets but no prefix - cannot determine which one
+        logger.debug(
+            f"Cannot infer dataset from source_id '{source_id}': "
+            f"no prefix and {len(self.dataset_paths)} datasets available"
+        )
         return None
     
     def _load_folder_dataset(self, dataset_path: str, dataset_name: str) -> Dict[str, str]:

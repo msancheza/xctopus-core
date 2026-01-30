@@ -5,12 +5,31 @@ System entry point: loads dataset, initializes components, and processes embeddi
 Integrates all previous phases into a complete flow.
 """
 
+import sys
+from pathlib import Path
+
+# Ensure parent package is in path for relative imports
+# This handles cases where the module is executed directly or imported
+_current_file = Path(__file__).resolve()
+_parent_dir = _current_file.parent  # xctopus/src/xctopus/
+_grandparent_dir = _parent_dir.parent  # xctopus/src/
+
+# Check if we're being executed directly (not as a module)
+_is_main_module = __name__ == "__main__" or not __package__
+
+# Add parent directories to sys.path if not already there
+# This allows both relative and absolute imports to work
+if _is_main_module:
+    # When executed directly, add directories to path
+    if str(_grandparent_dir) not in sys.path:
+        sys.path.insert(0, str(_grandparent_dir))
+    if str(_parent_dir) not in sys.path:
+        sys.path.insert(0, str(_parent_dir))
+
 import torch
 import numpy as np
 import logging
-from pathlib import Path
 from typing import List, Tuple, Optional
-import sys
 
 try:
     from rich.console import Console
@@ -35,17 +54,56 @@ except ImportError:
     TQDM_AVAILABLE = False
     TQDM_NOTEBOOK = False
 
-from .repository import KNRepository
-from .filter_bayesian import FilterBayesian
-from .orchestrator import Orchestrator
-from .fusion import fuse_knowledge_nodes
-from .settings import (
-    DB_PATH,
-    SAVE_BATCH_SIZE,
-    DEVICE,
-    DTYPE,
-    EMBEDDING_DIM,
-)
+# Handle both relative and absolute imports
+try:
+    # Try relative imports first (when used as a module)
+    from .repository import KNRepository
+    from .filter_bayesian import FilterBayesian
+    from .orchestrator import Orchestrator
+    from .fusion import fuse_knowledge_nodes
+    from .settings import (
+        DB_PATH,
+        SAVE_BATCH_SIZE,
+        DEVICE,
+        DTYPE,
+        PROCESS_BATCH_SIZE,
+        EMBEDDING_DIM,
+    )
+except ImportError:
+    # Fallback to absolute imports (when executed directly or package not found)
+    try:
+        from xctopus.repository import KNRepository
+        from xctopus.filter_bayesian import FilterBayesian
+        from xctopus.orchestrator import Orchestrator
+        from xctopus.fusion import fuse_knowledge_nodes
+        from xctopus.settings import (
+            DB_PATH,
+            SAVE_BATCH_SIZE,
+            DEVICE,
+            DTYPE,
+            PROCESS_BATCH_SIZE,
+            EMBEDDING_DIM,
+        )
+    except ImportError:
+        # Last resort: try direct imports from same directory
+        import sys
+        from pathlib import Path
+        # Add parent directory to path if not already there
+        current_dir = Path(__file__).parent
+        if str(current_dir) not in sys.path:
+            sys.path.insert(0, str(current_dir))
+        from repository import KNRepository
+        from filter_bayesian import FilterBayesian
+        from orchestrator import Orchestrator
+        from fusion import fuse_knowledge_nodes
+        from settings import (
+            DB_PATH,
+            SAVE_BATCH_SIZE,
+            DEVICE,
+            DTYPE,
+            PROCESS_BATCH_SIZE,
+            EMBEDDING_DIM,
+        )
 
 logger = logging.getLogger(__name__)
 console = Console() if RICH_AVAILABLE else None
@@ -82,13 +140,80 @@ def load_embeddings(dataset_path: str) -> List[torch.Tensor]:
     
     try:
         if extension == ".csv":
-            # CSV: assume each row is an embedding
-            data = np.loadtxt(dataset_path, delimiter=",", dtype=np.float32)
+            # CSV: handle headers and different formats
+            # Try pandas first (more robust for CSV with headers)
+            try:
+                import pandas as pd
+                df = pd.read_csv(dataset_path)
+                # Check if first row contains non-numeric data (likely header)
+                # If so, skip it and use the rest
+                if df.shape[1] > 0:
+                    # Try to convert to numeric, if fails, first row is header
+                    try:
+                        df_numeric = df.apply(pd.to_numeric, errors='coerce')
+                        # If first row has NaN values, it's likely a header
+                        if df_numeric.iloc[0].isna().any():
+                            logger.info("Detected CSV header, skipping first row")
+                            df = df.iloc[1:].reset_index(drop=True)
+                            df_numeric = df.apply(pd.to_numeric, errors='coerce')
+                        data = df_numeric.values.astype(np.float32)
+                    except Exception:
+                        # Fallback: try to read as numeric directly
+                        data = pd.to_numeric(df.values.flatten(), errors='coerce').reshape(-1, df.shape[1]).astype(np.float32)
+                else:
+                    raise ValueError("CSV file appears to be empty")
+            except ImportError:
+                # Fallback to numpy if pandas not available
+                logger.warning("pandas not available, using numpy.loadtxt (may fail with headers)")
+                # Try to detect header by reading first line
+                with open(dataset_path, 'r') as f:
+                    first_line = f.readline().strip()
+                    # Check if first line contains non-numeric values
+                    try:
+                        np.fromstring(first_line, sep=',', dtype=np.float32)
+                        skip_rows = 0  # No header
+                    except ValueError:
+                        skip_rows = 1  # Has header
+                        logger.info("Detected CSV header, skipping first row")
+                
+                data = np.loadtxt(dataset_path, delimiter=",", dtype=np.float32, skiprows=skip_rows)
+            
             if data.ndim == 1:
                 data = data.reshape(1, -1)
         elif extension == ".npy":
             # NPY: numpy array
-            data = np.load(dataset_path).astype(np.float32)
+            try:
+                # Prior check: verify physical size
+                if dataset_path.exists():
+                    actual_size = dataset_path.stat().st_size
+                    if actual_size == 0:
+                        raise ValueError("File exists but is empty (0 bytes).")
+                
+                # Attempt 1: Direct load
+                try:
+                    data = np.load(dataset_path).astype(np.float32)
+                except (OSError, ValueError) as e:
+                    if isinstance(e, OSError) and e.errno == 5:
+                        logger.warning(f"Direct read failure (Errno 5). Retrying with mmap_mode='r'...")
+                        # Attempt 2: Load via Memory Mapping (sometimes bypasses kernel buffer issues)
+                        data = np.load(dataset_path, mmap_mode='r').copy().astype(np.float32)
+                    else:
+                        raise e
+                        
+            except (OSError, ValueError) as e:
+                # If we get here, both attempts failed or file is unreadable
+                error_msg = f"ERROR: Critical failure reading embeddings '{dataset_path}'."
+                
+                if isinstance(e, OSError) and e.errno == 5:
+                    error_msg += " (Errno 5: Input/output error - Possible disk or network failure)"
+                elif "0 bytes" in str(e):
+                    error_msg += " (File is truncated/empty)"
+                
+                logger.error(error_msg)
+                print(f"\n[bold red]{error_msg}[/bold red]")
+                print(f"[yellow]Suggestion: Lightning.ai environment might have disk latency. Delete '{dataset_path.name}' and retry.[/yellow]\n")
+                raise ValueError(error_msg) from e
+                
             if data.ndim == 1:
                 data = data.reshape(1, -1)
         elif extension == ".npz":
@@ -195,16 +320,12 @@ def process_dataset(
     progress_interval: int = 100,
 ) -> None:
     """
-    Processes the complete dataset of embeddings.
+    Processes the complete dataset of embeddings using BATCH processing.
     
-    Flow for each embedding:
-    1. Routing: FilterBayesian decides route (uses in-memory signatures)
-    2. Execution: Orchestrator executes decision
-       - Immediate signature updates after each embedding is accepted
-    3. Batch commits: Periodic commit
-    
-    OPTIMIZED: Signatures are loaded once at startup (warmup).
-    Orchestrator handles intelligent refreshes, avoiding 18,233 SQL queries.
+    OPTIMIZED for High Throughput (>50 emb/s):
+    1. Iterates in chunks of PROCESS_BATCH_SIZE (default 64)
+    2. Sends batches to Orchestrator.process_batch()
+    3. Reduces python overhead and GPU latency
     
     Args:
         embeddings: List of embeddings to process
@@ -214,106 +335,222 @@ def process_dataset(
         progress_interval: How many embeddings to show progress (default: 100)
     """
     total_embeddings = len(embeddings)
-    logger.info(f"Starting processing of {total_embeddings} embeddings")
+    logger.info(f"Starting processing of {total_embeddings} embeddings (Batch Size: {PROCESS_BATCH_SIZE})")
     
     # Detect if we are in a notebook
     in_notebook = 'ipykernel' in sys.modules or 'IPython' in sys.modules
     
+    # Stack all embeddings into a single tensor for easy slicing
+    # [N, DIM]
+    if len(embeddings) > 0:
+        all_embeddings_tensor = torch.stack(embeddings).to(DEVICE, dtype=DTYPE)
+        # Generate Source IDs (indices) with dataset prefix if available
+        # This allows DataManager to infer the dataset when retrieving texts for training
+        dataset_name = None
+        if hasattr(orchestrator, 'data_manager') and orchestrator.data_manager.dataset_paths:
+            # If only one dataset is loaded, use it as prefix
+            if len(orchestrator.data_manager.dataset_paths) == 1:
+                dataset_name = list(orchestrator.data_manager.dataset_paths.keys())[0]
+                logger.debug(f"Using dataset prefix '{dataset_name}' for source_ids")
+            else:
+                # Multiple datasets: use first one as default (could be improved)
+                dataset_name = list(orchestrator.data_manager.dataset_paths.keys())[0]
+                logger.debug(f"Multiple datasets available, using '{dataset_name}' as prefix for source_ids")
+        
+        if dataset_name:
+            # Format: "dataset_name:index" (e.g., "20newsgroups:8293")
+            all_source_ids = [f"{dataset_name}:{i}" for i in range(total_embeddings)]
+        else:
+            # Fallback: just use indices (will fail to retrieve texts, but won't break)
+            logger.warning(
+                "No dataset paths configured in DataManager. "
+                "source_ids will be numeric only and may fail to retrieve texts for training. "
+                "Consider passing dataset_paths to Orchestrator initialization."
+            )
+            all_source_ids = [str(i) for i in range(total_embeddings)]
+    else:
+        logger.warning("Empty embeddings list.")
+        return
+        
+    num_batches = (total_embeddings + PROCESS_BATCH_SIZE - 1) // PROCESS_BATCH_SIZE
+    
     # Choose progress method based on environment
-    if in_notebook and TQDM_AVAILABLE:
-        # In notebooks: use tqdm (compatible with Jupyter, no duplication)
-        # Use file=sys.stdout to avoid stderr capture by logger
+    use_tqdm = False
+    tqdm_kwargs = None
+    
+    # Always try to use tqdm if available (not just in notebooks)
+    if TQDM_AVAILABLE:
+        # Force regular tqdm (not notebook) for better console compatibility
+        # Lightning AI Studio and other environments work better with regular tqdm
+        use_notebook_tqdm = False  # Force False for better compatibility
+        
+        # Check if we're actually in a real Jupyter notebook with proper display
+        if in_notebook and TQDM_NOTEBOOK:
+            try:
+                # Test if notebook display actually works
+                from IPython.display import display, clear_output
+                # If we can import, we might be in a real notebook
+                # But still prefer regular tqdm for console output
+                use_notebook_tqdm = False  # Force regular tqdm for visibility
+            except ImportError:
+                use_notebook_tqdm = False
+        
+        # Check if we're in a real terminal (not just a pipe)
+        is_terminal = hasattr(sys.stderr, 'isatty') and sys.stderr.isatty()
+        
         tqdm_kwargs = {
             "total": total_embeddings,
-            "desc": "Processing embeddings",
-            "unit": "embedding",
-            "mininterval": 0.5,  # Update at most every 0.5 seconds to reduce spam
-            "maxinterval": 1.0   # Force update every 1 second max
+            "desc": "Processing (Batch)",
+            "unit": "emb",
+            "mininterval": 0.1,   # Update every 0.1 seconds minimum
+            "maxinterval": 0.5,   # Maximum 0.5 seconds between updates
+            "file": sys.stderr,   # Use stderr for better visibility (doesn't interfere with stdout)
+            "ncols": 100,         # Fixed width for better visibility
+            "dynamic_ncols": False,  # Disable dynamic width
+            "disable": False,     # Ensure tqdm is enabled
+            "ascii": False,       # Use Unicode characters for better display
+            "leave": True,        # Keep progress bar after completion
+            "smoothing": 0.1,     # Smooth progress updates
         }
-        # For tqdm.notebook, don't set ncols (auto-adjusts to notebook width)
-        # For regular tqdm, use None to auto-adjust or a reasonable width
-        if not TQDM_NOTEBOOK:
-            tqdm_kwargs["file"] = sys.stdout
-            tqdm_kwargs["ncols"] = None  # Auto-adjust width
+        
+        # Only use position and custom format if we're in a real terminal
+        if is_terminal:
+            tqdm_kwargs["position"] = 0  # Position 0 to avoid multiple lines
+            tqdm_kwargs["bar_format"] = "{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]"
         else:
-            # tqdm.notebook handles width automatically
+            # If not a terminal, use simpler format and disable position
+            tqdm_kwargs["bar_format"] = "{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]"
+        
+        if use_notebook_tqdm:
+            # Use notebook-specific settings only if explicitly enabled
             tqdm_kwargs["ncols"] = None
+            tqdm_kwargs["file"] = None  # Notebook handles output
+        else:
+            # Force stdout/stderr for console visibility
+            tqdm_kwargs["file"] = sys.stderr  # stderr is better for progress bars
         
-        embeddings_iter = tqdm(enumerate(embeddings), **tqdm_kwargs)
-        
-        for i, embedding in embeddings_iter:
-            _process_single_embedding(
-                embedding, repository, filter_bayesian, orchestrator, i
-            )
-            
-            # Update postfix with KN and Buffer counts
-            counts = orchestrator.get_counts()
-            postfix_dict = {
-                "KNs": counts["kn_count"],
-                "Buffers": counts["buffer_count"]
-            }
-            # Add "T" if training is active (simple indicator, no RAM overhead)
-            if orchestrator.has_active_training():
-                postfix_dict["T"] = "T"
-            embeddings_iter.set_postfix(postfix_dict)
-            
-            # Periodic logging (DEBUG level to avoid console spam)
-            if (i + 1) % progress_interval == 0:
-                logger.debug(
-                    f"Processed {i + 1}/{total_embeddings} embeddings "
-                    f"({(i + 1) / total_embeddings * 100:.1f}%) | "
-                    f"KNs: {counts['kn_count']}, Buffers: {counts['buffer_count']}"
-                )
-    elif RICH_AVAILABLE and console and not in_notebook:
-        # Outside notebooks: use rich Progress (more elegant)
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-            TimeElapsedColumn(),
-            console=console,
-        ) as progress:
-            task = progress.add_task(
-                f"[cyan]Processing embeddings...",
-                total=total_embeddings
-            )
-            
-            for i, embedding in enumerate(embeddings):
-                _process_single_embedding(
-                    embedding, repository, filter_bayesian, orchestrator, i
-                )
-                
-                # Update progress with KN and Buffer info
-                counts = orchestrator.get_counts()
-                training_indicator = " T" if orchestrator.has_active_training() else ""
-                progress.update(
-                    task,
-                    advance=1,
-                    description=f"[cyan]Processing embeddings... [dim]KNs: {counts['kn_count']}, Buffers: {counts['buffer_count']}{training_indicator}[/dim]"
-                )
-                
-                # Periodic logging (DEBUG level to avoid console spam)
-                if (i + 1) % progress_interval == 0:
-                    logger.debug(
-                        f"Processed {i + 1}/{total_embeddings} embeddings "
-                        f"({(i + 1) / total_embeddings * 100:.1f}%) | "
-                        f"KNs: {counts['kn_count']}, Buffers: {counts['buffer_count']}"
-                    )
+        use_tqdm = True
+        logger.debug(f"Using tqdm for progress (notebook={in_notebook}, notebook_tqdm={TQDM_NOTEBOOK}, using_notebook={use_notebook_tqdm})")
     else:
-        # Fallback: use simple logging
-        for i, embedding in enumerate(embeddings):
-            _process_single_embedding(
-                embedding, repository, filter_bayesian, orchestrator, i
-            )
+        logger.debug("tqdm not available, using logging fallback")
+    
+    # Function to process a single batch
+    def process_chunk(batch_idx):
+        start_idx = batch_idx * PROCESS_BATCH_SIZE
+        end_idx = min(start_idx + PROCESS_BATCH_SIZE, total_embeddings)
+        
+        # Slice batch
+        batch_embeddings = all_embeddings_tensor[start_idx:end_idx]
+        batch_source_ids = all_source_ids[start_idx:end_idx]
+        
+        # Execute Batch (The Magic happens here)
+        orchestrator.process_batch(
+            batch_embeddings, 
+            source_ids=batch_source_ids
+        )
+        
+        return end_idx - start_idx
+        
+    if use_tqdm:
+        try:
+            logger.info(f"Starting batch processing: {num_batches} batches of ~{PROCESS_BATCH_SIZE} embeddings")
+            # Print message before creating progress bar
+            print(f"Procesando {num_batches} batches de ~{PROCESS_BATCH_SIZE} embeddings cada uno...", file=sys.stdout)
+            sys.stdout.flush()
             
-            # Periodic logging with counts (DEBUG level to avoid console spam)
-            if (i + 1) % progress_interval == 0:
+            # Import regular tqdm if notebook tqdm was imported but we want regular
+            if TQDM_NOTEBOOK and not use_notebook_tqdm:
+                from tqdm import tqdm as regular_tqdm
+                pbar = regular_tqdm(**tqdm_kwargs)
+            else:
+                pbar = tqdm(**tqdm_kwargs)
+            
+            sys.stderr.flush()  # Also flush stderr
+            
+            try:
+                # ========================================================================
+                # OPTIMIZATION: Block Processing (2025-01-25) - FIXED
+                # ========================================================================
+                # PROBLEM: Micro-management causing 143 DB calls + 286 I/O ops
+                # SOLUTION: Deliver all batches as block to orchestrator
+                # FIX: Ensure proper flow continuation
+                # ========================================================================
+                
+                # NEW BLOCK PROCESSING (FIXED):
+                try:
+                    all_batches = [(i, 
+                        all_embeddings_tensor[i*PROCESS_BATCH_SIZE:(i+1)*PROCESS_BATCH_SIZE],
+                        all_source_ids[i*PROCESS_BATCH_SIZE:(i+1)*PROCESS_BATCH_SIZE]
+                    ) for i in range(num_batches)]
+                    
+                    orchestrator.process_all_batches(all_batches, pbar)
+                    
+                    # CRITICAL: Ensure we continue to the next phase
+                    logger.info("Block processing completed successfully")
+                    
+                except Exception as e:
+                    logger.error(f"Block processing failed: {e}")
+                    logger.info("Falling back to original processing...")
+                    
+                    # Fallback to original processing
+                    for b_idx in range(num_batches):
+                        # Log start of batch (first few batches for debugging)
+                        if b_idx < 3 or (b_idx + 1) % 50 == 0:
+                            logger.info(f"Processing batch {b_idx + 1}/{num_batches}...")
+                        
+                        # Process batch
+                        processed_count = process_chunk(b_idx)
+                        
+                        # Update Stats every batch (before progress update)
+                        counts = orchestrator.get_counts()
+                        postfix_dict = {
+                            "KNs": counts["kn_count"],
+                            "Buf": counts["buffer_count"]
+                        }
+                        if orchestrator.has_active_training():
+                            postfix_dict["T"] = "ON"
+                        
+                        # Update Progress immediately (force update)
+                        pbar.set_postfix(postfix_dict, refresh=False)
+                        pbar.update(n=processed_count)
+                        
+                        # Force flush after each batch to ensure visibility
+                        sys.stderr.flush()
+                        sys.stdout.flush()
+                        
+                        # Log progress every 10 batches for debugging
+                        if (b_idx + 1) % 10 == 0:
+                            current_processed = min((b_idx + 1) * PROCESS_BATCH_SIZE, total_embeddings)
+                            logger.info(f"Progress: {b_idx + 1}/{num_batches} batches ({current_processed}/{total_embeddings} embeddings, {current_processed/total_embeddings*100:.1f}%)")
+                            pbar.write(f" == Progress: {b_idx + 1}/{num_batches} batches ({current_processed/total_embeddings*100:.1f}%)")
+                
+                # ========================================================================
+                    
+            finally:
+                pbar.close()
+                logger.info(f"Batch processing completed: {total_embeddings} embeddings processed")
+                print(f"\n   Process completed: {total_embeddings} embeddings processed")
+                sys.stdout.flush()
+                sys.stderr.flush()
+                    
+        except Exception as e:
+            logger.warning(f"tqdm error: {e}. Fallback to logging.")
+            import traceback
+            logger.debug(f"tqdm error details: {traceback.format_exc()}")
+            use_tqdm = False
+            
+    if not use_tqdm:
+        # Fallback loop
+        for b_idx in range(num_batches):
+            processed = process_chunk(b_idx)
+            current_total = (b_idx * PROCESS_BATCH_SIZE) + processed
+            
+            if (current_total) % progress_interval < PROCESS_BATCH_SIZE: # Approx interval
                 counts = orchestrator.get_counts()
                 logger.debug(
-                    f"Processed {i + 1}/{total_embeddings} embeddings "
-                    f"({(i + 1) / total_embeddings * 100:.1f}%) | "
-                    f"KNs: {counts['kn_count']}, Buffers: {counts['buffer_count']}"
+                    f"Processed {current_total}/{total_embeddings} "
+                    f"({current_total/total_embeddings*100:.1f}%) | "
+                    f"KNs: {counts['kn_count']}, Buf: {counts['buffer_count']}"
                 )
     
     logger.info(f"Processing completed: {total_embeddings} embeddings processed")
@@ -410,7 +647,7 @@ def _show_summary_rich(signatures: List[dict], active_nodes_count: int, reposito
         active_nodes_count: Number of active nodes
         repository: KNRepository instance to check training status
     """
-    console.print("\n[bold cyan]📊 Processing Summary[/bold cyan]\n")
+    console.print("\n[bold cyan]Processing Summary[/bold cyan]\n")
     
     # Calculate training statistics
     trained_nodes = sum(1 for sig in signatures if repository.is_trained(sig["node_id"]))
@@ -418,15 +655,15 @@ def _show_summary_rich(signatures: List[dict], active_nodes_count: int, reposito
     
     # General statistics table
     stats_table = Table(title="General Statistics", show_header=True, header_style="bold magenta")
-    stats_table.add_column("Métrica", style="cyan")
-    stats_table.add_column("Valor", style="green", justify="right")
+    stats_table.add_column("Metric", style="cyan")
+    stats_table.add_column("Value", style="green", justify="right")
     
     total_mass = sum(sig["mass"] for sig in signatures)
     avg_mass = total_mass / len(signatures) if signatures else 0
     avg_variance = sum(sig["variance"] for sig in signatures) / len(signatures) if signatures else 0
     
     stats_table.add_row("Total KnowledgeNodes", str(len(signatures)))
-    stats_table.add_row("Nodos Activos", str(active_nodes_count))
+    stats_table.add_row("Active Nodes", str(active_nodes_count))
     stats_table.add_row("Total Embeddings", str(total_mass))
     stats_table.add_row("Average Mass", f"{avg_mass:.1f}")
     stats_table.add_row("Average Variance", f"{avg_variance:.4f}")
@@ -435,11 +672,11 @@ def _show_summary_rich(signatures: List[dict], active_nodes_count: int, reposito
     
     # Training statistics table
     training_table = Table(title="Training Status", show_header=True, header_style="bold yellow")
-    training_table.add_column("Métrica", style="cyan")
-    training_table.add_column("Valor", style="green", justify="right")
+    training_table.add_column("Metric", style="cyan")
+    training_table.add_column("Value", style="green", justify="right")
     
-    training_table.add_row("Nodos Entrenados", str(trained_nodes))
-    training_table.add_row("Candidatos Potenciales (masa > 5)", str(candidates_potential))
+    training_table.add_row("Trained Nodes", str(trained_nodes))
+    training_table.add_row("Potential Candidates (mass > 5)", str(candidates_potential))
     
     console.print("\n")
     console.print(training_table)
@@ -483,9 +720,9 @@ def _show_summary_simple(signatures: List[dict], active_nodes_count: int, reposi
     trained_nodes = sum(1 for sig in signatures if repository.is_trained(sig["node_id"]))
     candidates_potential = sum(1 for sig in signatures if sig["mass"] > 5)
     
-    logger.info("📊 Análisis de Fin de Jornada:")
-    logger.info(f"   Nodos entrenados: {trained_nodes}")
-    logger.info(f"   Candidatos potenciales con masa > 5: {candidates_potential}")
+    logger.info("End of Day Analysis:")
+    logger.info(f"   Trained nodes: {trained_nodes}")
+    logger.info(f"   Potential candidates with mass > 5: {candidates_potential}")
     logger.info("=" * 60)
     logger.info("PROCESSING SUMMARY")
     logger.info("=" * 60)
@@ -529,19 +766,19 @@ def main(dataset_path: str) -> None:
     """
     try:
         logger.info("=" * 60)
-        logger.info("XCTOPUS - Capa Clustering")
+        logger.info("XCTOPUS - Clustering Layer")
         logger.info("=" * 60)
         
-        # 1. Cargar embeddings
+        # 1. Load embeddings
         embeddings = load_embeddings(dataset_path)
         
-        # 2. Inicializar componentes
+        # 2. Initialize components
         repository, filter_bayesian, orchestrator = initialize_components()
         
-        # 3. Procesar dataset
+        # 3. Process dataset
         process_dataset(embeddings, repository, filter_bayesian, orchestrator)
         
-        # 4. Fusionar Knowledge Nodes (post-clustering)
+        # 4. Fuse Knowledge Nodes (post-clustering)
         logger.info("Starting Knowledge Nodes fusion process...")
         fusion_stats = fuse_knowledge_nodes(repository, orchestrator)
         logger.info(

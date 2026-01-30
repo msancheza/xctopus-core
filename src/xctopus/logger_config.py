@@ -77,13 +77,19 @@ def _deduplication_filter(record: logging.LogRecord) -> bool:
 # stderr interception state
 _stderr_buffer = ""
 _original_stderr = None
+_stderr_wrapped = False
+_in_stderr_interceptor = False  # recursion guard (prevents logging->stderr->logging loops)
 
 
 def _stderr_write_interceptor(text: str, logger: logging.Logger):
     """Intercept stderr writes and redirect to logger."""
-    global _stderr_buffer
+    global _stderr_buffer, _in_stderr_interceptor
     
     if text:
+        # Prevent recursion if logging itself triggers stderr writes
+        if _in_stderr_interceptor:
+            return
+        _in_stderr_interceptor = True
         _stderr_buffer += text
         # Log complete lines
         if '\n' in _stderr_buffer:
@@ -100,19 +106,49 @@ def _stderr_write_interceptor(text: str, logger: logging.Logger):
                         (line.strip().startswith("Processing") or line.strip().startswith("Procesando")) and ("%" in line or "/" in line)
                     )
                     
-                    if not is_tqdm_output:
-                        # Log to file (only non-tqdm output)
-                        logger.error(f"[stderr] {line.strip()}")
-                    # Always write to original stderr for compatibility (tqdm needs this)
-                    if _original_stderr:
-                        _original_stderr.write(f"{line}\n")
+                    # Filter out harmless HuggingFace Colab secrets warnings (we use public models, no token needed)
+                    is_hf_secret_warning = (
+                        "HF_TOKEN" in line and "does not exist" in line or
+                        "secret" in line.lower() and "colab" in line.lower() and "token" in line.lower() or
+                        "huggingface_hub" in line.lower() and "userwarning" in line.lower() or
+                        "You will be able to reuse this secret" in line or
+                        "authentication is recommended but still optional" in line.lower()
+                    )
+                    
+                    # Filter out lines that are already logged (prevent recursion)
+                    is_already_logged = (
+                        "[stderr]" in line or
+                        "ERROR:xctopus:" in line or
+                        line.strip().startswith("00:")
+                    )
+                    
+                    if not is_tqdm_output and not is_hf_secret_warning and not is_already_logged:
+                        # Log to file ONLY (not console) to prevent recursion
+                        # Temporarily disable console handler, log, then re-enable
+                        file_logger = logging.getLogger("xctopus")
+                        console_handlers = []
+                        for handler in file_logger.handlers[:]:
+                            if isinstance(handler, logging.StreamHandler) and not isinstance(handler, logging.FileHandler):
+                                file_logger.removeHandler(handler)
+                                console_handlers.append(handler)
+                        
+                        # Log only to file handlers
+                        file_logger.error(f"[stderr] {line.strip()}")
+                        
+                        # Restore console handlers
+                        for handler in console_handlers:
+                            file_logger.addHandler(handler)
+        _in_stderr_interceptor = False
 
 
 def _stderr_flush_interceptor(logger: logging.Logger):
     """Flush stderr buffer."""
-    global _stderr_buffer
+    global _stderr_buffer, _in_stderr_interceptor
     
     if _stderr_buffer.strip():
+        if _in_stderr_interceptor:
+            return
+        _in_stderr_interceptor = True
         # Filter out tqdm progress bars (they write to stderr but aren't errors)
         is_tqdm_output = (
             "Processing embeddings" in _stderr_buffer or
@@ -121,12 +157,40 @@ def _stderr_flush_interceptor(logger: logging.Logger):
             (_stderr_buffer.strip().startswith("Processing") or _stderr_buffer.strip().startswith("Procesando")) and ("%" in _stderr_buffer or "/" in _stderr_buffer)
         )
         
-        if not is_tqdm_output:
-            logger.error(f"[stderr] {_stderr_buffer.strip()}")
-        if _original_stderr:
-            _original_stderr.write(_stderr_buffer)
-            _stderr_buffer = ""
-            _original_stderr.flush()
+        # Filter out harmless HuggingFace Colab secrets warnings (we use public models, no token needed)
+        is_hf_secret_warning = (
+            "HF_TOKEN" in _stderr_buffer and "does not exist" in _stderr_buffer or
+            "secret" in _stderr_buffer.lower() and "colab" in _stderr_buffer.lower() and "token" in _stderr_buffer.lower() or
+            "huggingface_hub" in _stderr_buffer.lower() and "userwarning" in _stderr_buffer.lower() or
+            "You will be able to reuse this secret" in _stderr_buffer or
+            "authentication is recommended but still optional" in _stderr_buffer.lower()
+        )
+        
+        # Filter out lines that are already logged (prevent recursion)
+        is_already_logged = (
+            "[stderr]" in _stderr_buffer or
+            "ERROR:xctopus:" in _stderr_buffer or
+            _stderr_buffer.strip().startswith("00:")
+        )
+        
+        if not is_tqdm_output and not is_hf_secret_warning and not is_already_logged:
+            # Log to file ONLY (not console) to prevent recursion
+            # Temporarily disable console handler, log, then re-enable
+            file_logger = logging.getLogger("xctopus")
+            console_handlers = []
+            for handler in file_logger.handlers[:]:
+                if isinstance(handler, logging.StreamHandler) and not isinstance(handler, logging.FileHandler):
+                    file_logger.removeHandler(handler)
+                    console_handlers.append(handler)
+            
+            # Log only to file handlers
+            file_logger.error(f"[stderr] {_stderr_buffer.strip()}")
+            
+            # Restore console handlers
+            for handler in console_handlers:
+                file_logger.addHandler(handler)
+        _stderr_buffer = ""
+        _in_stderr_interceptor = False
 
 
 def _custom_excepthook(exc_type, exc_value, exc_traceback):
@@ -204,24 +268,61 @@ def setup_logging(
     # Crear directorio de logs si no existe
     _log_dir.mkdir(exist_ok=True)
     
+    # IMPORTANT: Set root logger to WARNING FIRST to prevent DEBUG messages from propagating
+    # This ensures that only our configured handlers control what goes to console
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.WARNING)
+    
+    # Remove any existing handlers from root logger to prevent duplicate messages
+    for handler in root_logger.handlers[:]:
+        root_logger.removeHandler(handler)
+    
     # Get main logger
     logger = logging.getLogger("xctopus")
     logger.setLevel(logging.DEBUG)
     
-    # Avoid duplicating handlers if they're already configured
+    # IMPORTANT: Clear existing handlers to allow reconfiguration
+    # This is necessary when the logger is already configured (e.g., in Colab)
+    # We want to ensure the correct handlers are in place
     if logger.handlers:
-        return
+        # Remove existing handlers to avoid duplicates
+        for handler in logger.handlers[:]:
+            logger.removeHandler(handler)
     
     # ========================================================================
     # FileHandler: Everything to file (DEBUG)
     # ========================================================================
     
-    file_handler = RotatingFileHandler(
-        _log_file,
-        maxBytes=_log_max_bytes,
-        backupCount=_log_backup_count,
-        encoding='utf-8'
-    )
+    try:
+        # Intentar usar RotatingFileHandler con el nombre por defecto
+        file_handler = RotatingFileHandler(
+            _log_file,
+            maxBytes=_log_max_bytes,
+            backupCount=_log_backup_count,
+            encoding='utf-8'
+        )
+    except OSError:
+        # Si falla (bloqueo o error de I/O), intentar con un nombre único (timestamp)
+        # Esto evita conflictos con procesos anteriores que retienen el archivo
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        new_log_file = _log_dir / f"xctopus_{timestamp}.log"
+        print(f"WARNING: Could not write to {_log_file}. Switching to unique file: {new_log_file}")
+        
+        try:
+            file_handler = logging.FileHandler(
+                new_log_file,
+                encoding='utf-8'
+            )
+        except OSError as e:
+            # Si falla incluso con nombre único, intentar en /tmp
+            import tempfile
+            tmp_log = Path(tempfile.gettempdir()) / f"xctopus_{timestamp}.log"
+            print(f"CRITICAL: Could not write to log dir. Switching to /tmp: {tmp_log}")
+            file_handler = logging.FileHandler(
+                tmp_log,
+                encoding='utf-8'
+            )
+
     file_handler.setLevel(getattr(logging, _log_level_file))
     
     # Format for file: timestamp | level | module | message
@@ -251,29 +352,49 @@ def setup_logging(
     
     logger.addHandler(console_handler)
     
+    # IMPORTANT: Allow propagation from child loggers to this logger
+    # Child loggers (xctopus.orchestrator, xctopus.repository, etc.) will propagate
+    # to this 'xctopus' logger, which has our handlers configured
+    # They will NOT propagate to root logger because:
+    # 1. Root logger is set to WARNING level (filters DEBUG/INFO)
+    # 2. Root logger has no handlers (so even WARNING/ERROR won't show in console)
+    logger.propagate = True  # Allow children to propagate to this logger
+    
+    # IMPORTANT: Child loggers (xctopus.orchestrator, xctopus.repository, etc.) 
+    # will automatically propagate to parent 'xctopus' logger (which has our handlers)
+    # They will NOT propagate to root logger because root is set to WARNING and has no handlers
+    # This means:
+    # - DEBUG/INFO messages go to file (via xctopus logger's FileHandler)
+    # - WARNING/ERROR messages go to console (via xctopus logger's ConsoleHandler)
+    # - No messages go to root logger (it's set to WARNING and has no handlers)
+    
     # ========================================================================
     # Intercept stderr to capture external library errors
     # ========================================================================
-    # Capture errors from PyTorch, transformers, etc. that write to stderr
-    global _original_stderr
-    _original_stderr = sys.stderr
-    
-    # Create wrapper object for stderr that intercepts writes
-    class StderrWrapper:
-        def write(self, text: str):
-            _stderr_write_interceptor(text, logger)
-            if _original_stderr:
-                _original_stderr.write(text)
-        
-        def flush(self):
-            _stderr_flush_interceptor(logger)
-            if _original_stderr:
-                _original_stderr.flush()
-        
-        def __getattr__(self, name):
-            return getattr(_original_stderr, name)
-    
-    sys.stderr = StderrWrapper()
+    # In notebooks (Colab/Jupyter), setup_logging() may be called multiple times.
+    # Re-wrapping sys.stderr causes recursion (wrapper writing into itself).
+    global _original_stderr, _stderr_wrapped
+
+    # Detect if stderr is already wrapped by us
+    if not _stderr_wrapped:
+        _original_stderr = sys.stderr
+
+        class StderrWrapper:
+            def write(self, text: str):
+                _stderr_write_interceptor(text, logger)
+                if _original_stderr and _original_stderr is not self:
+                    _original_stderr.write(text)
+
+            def flush(self):
+                _stderr_flush_interceptor(logger)
+                if _original_stderr and _original_stderr is not self:
+                    _original_stderr.flush()
+
+            def __getattr__(self, name):
+                return getattr(_original_stderr, name)
+
+        sys.stderr = StderrWrapper()
+        _stderr_wrapped = True
     
     # ========================================================================
     # Intercept unhandled exceptions

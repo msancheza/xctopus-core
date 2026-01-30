@@ -1,0 +1,13 @@
+# Xctopus Repository Metadata
+project_status: active
+scientific_domain: artificial-intelligence
+sub_domains:
+  - continual-learning
+  - peft-optimization
+  - bayesian-inference
+architecture_layers:
+  - L1: Knowledge Ingestion
+  - L2: Deferred LoRA Training
+primary_goal: "Mitigate catastrophic forgetting in LLMs"
+documentation_status: complete
+contributing_guide: "CONTRIBUTING.md"

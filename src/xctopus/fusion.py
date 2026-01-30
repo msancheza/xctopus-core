@@ -34,10 +34,12 @@ from .settings import (
     DEVICE,
     DTYPE,
     EMBEDDING_DIM,
+    S_MIN,
     FUSION_SIMILARITY_THRESHOLD,
     FUSION_MIN_MASS,
     FUSION_MAX_VARIANCE,
     FUSION_VARIANCE_INCREASE_THRESHOLD,
+    MIN_TRAINING_TEXTS,
 )
 
 logger = logging.getLogger(__name__)
@@ -282,18 +284,27 @@ def fuse_knowledge_nodes(
     else:
         logger.debug("Post-fusion: No additional nodes needed marking for training")
     
-    # Phase 4: Re-assign orphan buffers
-    logger.info("Phase 4: Re-assigning orphan buffers...")
+    # Phase 4: Consolidate micro-nodes (2025-01-27)
+    # Forced merge for nodes with < 6 texts to avoid information loss
+    logger.info("Phase 4: Consolidating micro-nodes (< 6 texts)...")
+    micro_consolidated = consolidate_micro_nodes(
+        repository,
+        orchestrator,
+        min_training_texts=MIN_TRAINING_TEXTS
+    )
+    
+    # Phase 5: Re-assign orphan buffers
+    logger.info("Phase 5: Re-assigning orphan buffers...")
     buffers_reassigned = _reassign_orphan_buffers(
         repository,
         orchestrator,
         in_notebook=in_notebook
     )
     
-    # Phase 5: Calculate training metadata (optional)
+    # Phase 6: Calculate training metadata (optional)
     metadata_updated = 0
     if calculate_metadata:
-        logger.info("Phase 5: Calculating training metadata...")
+        logger.info("Phase 6: Calculating training metadata...")
         try:
             metadata_stats = _calculate_training_metadata(repository, orchestrator)
             metadata_updated = metadata_stats.get('updated', 0)
@@ -320,16 +331,20 @@ def fuse_knowledge_nodes(
     logger.info(f"Initial KNs: {initial_kns_count}")
     logger.info(f"Final KNs: {final_kns_count}")
     logger.info(f"Fusions performed: {fusions_performed}")
+    logger.info(f"Micro-nodes consolidated: {micro_consolidated}")
     logger.info(f"Buffers reassigned: {buffers_reassigned}")
     if calculate_metadata:
         logger.info(f"Metadata updated: {metadata_updated}")
     logger.info(f"Reduction: {initial_kns_count - final_kns_count} KNs ({((initial_kns_count - final_kns_count) / initial_kns_count * 100):.1f}%)")
-    logger.info("=" * 60)
+    # Final commit to ensure all atomic migrations and deletions are persisted
+    if repository.conn:
+        repository.conn.commit()
     
     result = {
         'initial_kns': initial_kns_count,
         'final_kns': final_kns_count,
         'fusions_performed': fusions_performed,
+        'micro_consolidated': micro_consolidated,
         'buffers_reassigned': buffers_reassigned
     }
     
@@ -337,6 +352,91 @@ def fuse_knowledge_nodes(
         result['metadata_updated'] = metadata_updated
     
     return result
+
+
+def consolidate_micro_nodes(
+    repository: KNRepository,
+    orchestrator: Orchestrator,
+    min_training_texts: int = 6,
+    similarity_floor: float = 0.55,
+) -> int:
+    """
+    Forcefully merge nodes with fewer than min_training_texts with their 
+    most similar semantic neighbor to avoid information loss.
+    
+    Args:
+        repository: KNRepository instance
+        orchestrator: Orchestrator instance
+        min_training_texts: Threshold to consider a node "micro"
+        similarity_floor: Minimum similarity to allow forced merge (safety block)
+        
+    Returns:
+        int: Number of micro-nodes consolidated
+    """
+    signatures = repository.get_all_signatures()
+    # CRITICAL: Filter out SEED nodes from mandatory consolidation
+    # SEED nodes, even if small, must preserve their identity
+    micro_nodes = [
+        sig for sig in signatures 
+        if sig["mass"] <= min_training_texts and sig.get("origin_type", "ORGANIC") != "SEED"
+    ]
+    
+    if not micro_nodes or len(signatures) < 2:
+        return 0
+        
+    logger.info(f"Checking {len(micro_nodes)} micro-nodes (mass <= {min_training_texts}) for mandatory consolidation...")
+    consolidated_count = 0
+    processed_this_run: Set[str] = set()
+    
+    # Sort micro-nodes by mass ascending (smallest first)
+    micro_nodes.sort(key=lambda x: x["mass"])
+    
+    for micro_sig in micro_nodes:
+        micro_id = micro_sig["node_id"]
+        if micro_id in processed_this_run:
+            continue
+            
+        # Refetch all signatures to account for previous fusions in this loop
+        current_sigs = repository.get_all_signatures()
+        candidates = [s for s in current_sigs if s["node_id"] != micro_id]
+        
+        if not candidates:
+            continue
+            
+        micro_centroid = micro_sig["centroid"].to(device=DEVICE, dtype=DTYPE)
+        
+        best_target_id = None
+        best_sim = -1.0
+        
+        for cand in candidates:
+            sim = F.cosine_similarity(
+                micro_centroid.unsqueeze(0),
+                cand["centroid"].to(device=DEVICE, dtype=DTYPE).unsqueeze(0),
+                dim=1
+            ).item()
+            
+            if sim > best_sim:
+                best_sim = sim
+                best_target_id = cand["node_id"]
+        
+        # Mandatory merge if above safety floor
+        if best_target_id and best_sim >= similarity_floor:
+            try:
+                merged_id = _merge_two_kns(
+                    micro_id,
+                    best_target_id,
+                    repository,
+                    orchestrator
+                )
+                if merged_id:
+                    consolidated_count += 1
+                    processed_this_run.add(micro_id)
+                    processed_this_run.add(best_target_id)
+                    logger.debug(f"Micro-node {micro_id[:8]} consolidated with {best_target_id[:8]} (sim={best_sim:.3f})")
+            except Exception as e:
+                logger.error(f"Failed to consolidate micro-node {micro_id}: {e}")
+                
+    return consolidated_count
 
 
 def _calculate_semantic_adjacency_matrix(
@@ -376,7 +476,7 @@ def _calculate_semantic_adjacency_matrix(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
             BarColumn(),
-            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+            TextColumn("[progress.percentage]{task.percentage:>6.2f}%"),
             TimeElapsedColumn(),
             console=console,
         )
@@ -454,6 +554,11 @@ def _identify_fusion_candidates(
     }
     
     for sig in signatures:
+        # CRITICAL: SEED nodes are immune to being absorbed as "small" nodes
+        is_seed = sig.get("origin_type", "ORGANIC") == "SEED"
+        if is_seed:
+            continue
+
         is_small = sig["mass"] <= FUSION_MIN_MASS
         is_stable = sig["variance"] <= FUSION_MAX_VARIANCE
         
@@ -596,7 +701,7 @@ def _execute_fusions(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
             BarColumn(),
-            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+            TextColumn("[progress.percentage]{task.percentage:>6.2f}%"),
             TimeElapsedColumn(),
             console=console,
         )
@@ -789,76 +894,42 @@ def _merge_two_kns(
     # ========================================================================
     # Load KnowledgeNode using from_repository() (2025-12-27)
     # ========================================================================
-    # Changed from keeping the directly created KnowledgeNode to loading
-    # from Repository using from_repository(). This ensures consistency:
-    # - PEFT metadata is loaded correctly (even if None)
-    # - Training status is loaded correctly (even if None)
-    # - Node state matches Repository state exactly
-    # ========================================================================
     try:
-        # Reload from Repository to ensure metadata is synchronized
         kn_loaded = KnowledgeNode.from_repository(repository, merged_node_id)
         kn = kn_loaded
     except ValueError as e:
-        # This should never happen since we just saved the node
-        logger.error(
-            f"Failed to load merged node '{merged_node_id}' from Repository after saving: {e}. "
-            f"Using directly created node (metadata may be incomplete)."
-        )
-        # Fallback: use the directly created node (metadata may be incomplete)
+        logger.error(f"Failed to load merged node '{merged_node_id}': {e}. Using direct node.")
         pass
-    
-    # Move embeddings to new node (if they exist)
-    if all_embeddings:
-        for emb in all_embeddings:
-            repository.add_embedding_to_memory(merged_node_id, emb)
-    
+
     # ========================================================================
     # Herencia de Estado para Deferred Training (2025-01-14)
     # ========================================================================
-    # Aplicar reglas de herencia antes de eliminar nodos originales:
-    # 1. Si alguno tenía needs_training, el fusionado también
-    # 2. Si alguno estaba entrenado, marcar para re-entrenamiento
-    # 3. Si masa >= TRAINING_THRESHOLD, marcar automáticamente
-    # ========================================================================
-    
-    # Verificar flags de nodos originales antes de eliminarlos
+    # Aplicar reglas de herencia antes de eliminar nodos originales
     pending_training_nodes = repository.get_pending_training_nodes()
     needs_training_1 = node_id_1 in pending_training_nodes
     needs_training_2 = node_id_2 in pending_training_nodes
     is_trained_1 = repository.is_trained(node_id_1)
     is_trained_2 = repository.is_trained(node_id_2)
     
-    # Regla 1: Herencia de needs_training (si alguno tenía el flag, heredarlo)
     if needs_training_1 or needs_training_2:
         repository.mark_for_training(merged_node_id, is_retraining=False)
-        logger.debug(
-            f"Merged node '{merged_node_id}' marked for training "
-            f"(inherited: node1_needs={needs_training_1}, node2_needs={needs_training_2})"
-        )
     
-    # Regla 2: Re-entrenamiento si alguno estaba entrenado
-    # El centroide cambió (promedio ponderado), el adaptador LoRA es obsoleto
     if is_trained_1 or is_trained_2:
         repository.mark_for_training(merged_node_id, is_retraining=True)
-        logger.debug(
-            f"Merged node '{merged_node_id}' marked for re-training "
-            f"(one of original nodes was trained: node1_trained={is_trained_1}, "
-            f"node2_trained={is_trained_2}, centroid changed)"
-        )
     
-    # Regla 3: Marcar automáticamente si masa >= TRAINING_THRESHOLD
-    # (solo si no está ya marcado y no está entrenado)
     if total_mass >= TRAINING_THRESHOLD:
         if not repository.is_trained(merged_node_id):
-            # Verificar si ya está marcado (evitar duplicados)
-            current_pending = repository.get_pending_training_nodes()
-            if merged_node_id not in current_pending:
-                repository.mark_for_training(merged_node_id, is_retraining=False)
-                logger.debug(
-                    f"Merged node '{merged_node_id}' marked for training "
-                    f"(mass={total_mass} >= {TRAINING_THRESHOLD})"
-                )
+            repository.mark_for_training(merged_node_id, is_retraining=False)
+
+    # ========================================================================
+    # CRITICAL: Atomic Pointer Migration (2025-01-27)
+    # ========================================================================
+    try:
+        count = repository.reassign_all_pointers([node_id_1, node_id_2], merged_node_id)
+        if count > 0:
+            logger.debug(f"Atomically transferred {count} pointers to merged node '{merged_node_id}'")
+    except Exception as e:
+        logger.error(f"Error during atomic pointer migration: {e}.")
     
     # Delete original nodes
     repository.delete_kn(node_id_1)
@@ -897,8 +968,6 @@ def _reassign_orphan_buffers(
     Returns:
         Number of buffers reassigned
     """
-    from .settings import S_MIN
-    
     buffer_ids = repository.get_all_active_buffers()
     if not buffer_ids:
         return 0
@@ -925,7 +994,7 @@ def _reassign_orphan_buffers(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
             BarColumn(),
-            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+            TextColumn("[progress.percentage]{task.percentage:>6.2f}%"),
             TimeElapsedColumn(),
             console=console,
         )
@@ -1001,20 +1070,42 @@ def _reassign_orphan_buffers(
     return reassigned
 
 
-def _calculate_training_epochs(mass: int, variance: float, num_texts: Optional[int] = None) -> int:
+def _calculate_training_epochs(
+    mass: int, 
+    variance: float, 
+    num_texts: Optional[int] = None,
+    parent_similarity: Optional[float] = None
+) -> int:
     """
     Calculate estimated number of epochs based on node complexity.
     
     Formula: complexity = log1p(mass) * (1 + variance)
-    Epochs = clip(complexity * 0.5, 2, 7)
+    Epochs = clip(complexity * 0.5, 1, 7)
+    
+    Inheritance Adjustment:
+    If parent_similarity is provided, apply discount:
+    discount = 1.0 - (parent_similarity * 0.5)
+    complexity *= discount
+    
+    Volume Discount (2025-01-XX):
+    If mass > 200, apply 0.7x multiplier to final epochs (after mapping).
+    Rationale: Massive nodes have enough data diversity, multiple epochs
+    are redundant and risk overfitting. This follows best practices from
+    high-performance ML centers.
+    
+    Safety Floor:
+    Always guarantees at least 1 epoch, regardless of discounts applied.
+    Multiple validation layers ensure this: max(1, int(epochs * 0.7)) and
+    final safety check: max(1, epochs).
     
     Args:
         mass: Node mass (number of embeddings)
         variance: Node variance (semantic dispersion)
         num_texts: Number of texts for training (optional, for adjustment)
+        parent_similarity: Cosine similarity to parent node (0.0-1.0), or None
     
     Returns:
-        int: Estimated number of epochs (2-7)
+        int: Estimated number of epochs (1-7, always >= 1)
     """
     # Validate inputs
     if mass <= 0:
@@ -1045,9 +1136,57 @@ def _calculate_training_epochs(mass: int, variance: float, num_texts: Optional[i
             complexity *= 1.2  # Small datasets: more epochs
         elif num_texts > 100:
             complexity *= 0.8  # Large datasets: fewer epochs
+
+    # ========================================================================
+    # Inheritance Discount (2025-01-XX)
+    # ========================================================================
+    if parent_similarity is not None and parent_similarity > 0:
+        # Discount factor: 1.0 - (similarity * 0.5)
+        # e.g., sim=0.9 -> discount=0.55 (45% reduction)
+        # e.g., sim=0.6 -> discount=0.70 (30% reduction)
+        discount = 1.0 - (parent_similarity * 0.5)
+        
+        # Safety clip for discount (shouldn't be needed if sim is 0-1, but safe)
+        discount = np.clip(discount, 0.5, 1.0)
+        
+        complexity *= discount
+        # logger.debug(f"Applied inheritance discount: {discount:.2f} (sim={parent_similarity:.2f})")
     
-    # Map to epochs (factor 0.5, range 2-7)
-    epochs = int(np.clip(complexity * 0.5, 2, 7))
+    # ========================================================================
+    # PASO 1: Mapear complejidad a épocas (como siempre)
+    # ========================================================================
+    # Map to epochs (factor 0.5, range 1-7)
+    # CRITICAL: Safety Floor = 1 epoch (never 0)
+    epochs = int(np.clip(complexity * 0.5, 1, 7))
+    
+    # ========================================================================
+    # PASO 2: Aplicar descuento por volumen a épocas finales (2025-01-XX)
+    # ========================================================================
+    # Rationale: Nodes with mass > 200 have enough data diversity
+    # Multiple epochs are redundant and risk overfitting
+    # This follows best practices from high-performance ML centers
+    # IMPORTANT: This is applied AFTER mapping to epochs, not to complexity
+    # It's an additional optimization layer, not a replacement for inheritance discount
+    # ========================================================================
+    if mass > 200:
+        # Apply volume discount: 0.7x multiplier to final epochs
+        # CRITICAL: Always maintain minimum of 1 epoch (safety floor)
+        epochs_before = epochs
+        epochs = max(1, int(epochs * 0.7))  # max(1, ...) ensures minimum of 1
+        
+        logger.debug(
+            f"Applied volume discount to final epochs: "
+            f"mass={mass}, epochs_before={epochs_before}, "
+            f"epochs_after={epochs}"
+        )
+    
+    # ========================================================================
+    # Safety Floor: Always ensure at least 1 epoch (2025-01-XX)
+    # ========================================================================
+    # CRITICAL: No matter what discounts are applied, every node must train
+    # for at least 1 epoch. This ensures the model sees the data at least once.
+    # ========================================================================
+    epochs = max(1, epochs)  # Final safety check
     
     return epochs
 
@@ -1111,13 +1250,14 @@ def _calculate_training_metadata(
                 n.node_id, 
                 n.mass, 
                 n.variance,
+                n.parent_similarity,     -- Added Phase 3
                 COUNT(ndm.source_id) as num_texts
             FROM nodes n
             LEFT JOIN node_data_mapping ndm ON n.node_id = ndm.node_id
             WHERE n.needs_training = 1 
             AND n.mass > 0 
             AND n.variance IS NOT NULL
-            GROUP BY n.node_id, n.mass, n.variance
+            GROUP BY n.node_id, n.mass, n.variance, n.parent_similarity
         """)
         rows = cursor.fetchall()
         
@@ -1144,7 +1284,10 @@ def _calculate_training_metadata(
             
             try:
                 # Calculate epochs and priority
-                epochs = _calculate_training_epochs(mass, variance, num_texts)
+                # Phase 3: Pass parent_similarity if available in row (need to fetch it first)
+                parent_similarity = row["parent_similarity"] if "parent_similarity" in row.keys() else None
+                
+                epochs = _calculate_training_epochs(mass, variance, num_texts, parent_similarity)
                 priority = _calculate_training_priority(mass, variance)
                 
                 # Update in repository

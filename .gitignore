@@ -243,7 +243,11 @@ secrets.yaml
 secrets.yml
 credentials.json
 credentials.yaml
-
+# ============================================================================
+# User Specific Execution Scripts (Private)
+# ============================================================================
+run_evaluation.py
+main.py
 # ============================================================================
 # Documentation Build
 # ============================================================================
@@ -289,7 +293,7 @@ notebooks/outputs/
 # Legacy folders (removed - not compatible with Layer 1)
 tests/
 scripts/
-
+benchmarks/
 # Repository data (legacy/generated - NOT needed for GitHub)
 # This folder contains generated files from old code versions
 # Current code uses SQLite BLOBs instead of file-based storage

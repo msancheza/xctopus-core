@@ -83,6 +83,7 @@ class FilterBayesian:
         Incrementally update a single node's state in memory.
         
         This avoids full re-initialization of tensors (O(1) vs O(N)).
+        If the node doesn't exist, it will be added (e.g., when a buffer is promoted).
         
         Args:
             node_id: The ID of the node to update
@@ -90,9 +91,25 @@ class FilterBayesian:
             new_mass: New mass value
         """
         if node_id not in self.ids:
-            # If node doesn't exist in current state, we can't update it cheaply
-            # This shouldn't happen in normal flow if signatures are refreshed periodically
-            logger.warning(f"Attempted partial update on unknown node {node_id}")
+            # Node doesn't exist - this can happen when a buffer is promoted to KN
+            # Add the new node to FilterBayesian instead of just warning
+            # Ensure correct device/dtype
+            new_centroid = new_centroid.to(device=DEVICE, dtype=DTYPE)
+            
+            # Append new node to tensors
+            self.ids.append(node_id)
+            
+            # Handle case when FilterBayesian is empty (centroids/masses are None)
+            if self.centroids is None or self.masses is None:
+                # Initialize with first node
+                self.centroids = new_centroid.unsqueeze(0)
+                self.masses = torch.tensor([float(new_mass)], device=DEVICE, dtype=DTYPE)
+            else:
+                # Append to existing tensors
+                self.centroids = torch.cat([self.centroids, new_centroid.unsqueeze(0)], dim=0)
+                self.masses = torch.cat([self.masses, torch.tensor([float(new_mass)], device=DEVICE, dtype=DTYPE)])
+            
+            logger.debug(f"Added new node to FilterBayesian: {node_id} (mass={new_mass})")
             return
 
         idx = self.ids.index(node_id)
@@ -236,3 +253,101 @@ class FilterBayesian:
         )
         
         return best_node_id, best_score
+
+    def route_batch(self, embeddings: torch.Tensor) -> List[Tuple[str, float]]:
+        """
+        Route a batch of embeddings to the best Knowledge Node.
+        
+        Optimized matrix routing: M vs N nodes in a single operation.
+        
+        Args:
+            embeddings: Batch of embeddings [BATCH_SIZE, 384]
+            
+        Returns:
+            List of Tuples (node_id or "NEW_BUFFER", score) for each embedding
+        """
+        if embeddings is None or embeddings.numel() == 0:
+            return []
+            
+        # Ensure it's 2D
+        if embeddings.dim() == 1:
+            embeddings = embeddings.unsqueeze(0)
+            
+        # Ensure device and dtype
+        embeddings = embeddings.to(device=DEVICE, dtype=DTYPE)
+        
+        batch_size = embeddings.shape[0]
+        
+        # Rule 4: Statistical Stability - Check signatures
+        if self.centroids is None or len(self.ids) == 0:
+            logger.debug("No signatures available, returning NEW_BUFFER for batch")
+            return [("NEW_BUFFER", 0.0)] * batch_size
+            
+        # ========================================================================
+        # Vectorized Calculation: Matrix Multiplication
+        # [BATCH, DIM] x [N, DIM]^T = [BATCH, N]
+        # ========================================================================
+        
+        # Normalize embeddings for cosine similarity (assuming centroids are normalized)
+        # Note: F.cosine_similarity does this internally, but for matmul we need explicit norm
+        embeddings_norm = F.normalize(embeddings, p=2, dim=1)
+        # We assume self.centroids are already normalized (should be done in refresh_signatures if not)
+        # Safety: normalize centroids just in case (cheap if cached, but let's assume they are)
+        # self.centroids is [N, DIM]
+        centroids_norm = F.normalize(self.centroids, p=2, dim=1)
+        
+        # Similarity Matrix [BATCH, N]
+        sims_matrix = torch.matmul(embeddings_norm, centroids_norm.T)
+        
+        # ========================================================================
+        # Rule 2: Semantic Purity (Dynamic Threshold)
+        # ========================================================================
+        
+        mass_log = torch.log1p(self.masses)
+        mass_log_safe = torch.clamp(mass_log, min=THRESH_MIN_LOG)
+        dynamic_thresholds = S_MIN - (THRESH_DECAY / mass_log_safe) # [N]
+        
+        # Expand thresholds to [BATCH, N] for comparison
+        thresholds_expanded = dynamic_thresholds.unsqueeze(0).expand(batch_size, -1)
+        
+        # Valid Mask [BATCH, N]
+        valid_mask = sims_matrix >= thresholds_expanded
+        
+        # ========================================================================
+        # Rule 1: Critical Mass (Biased Routing)
+        # ========================================================================
+        
+        # Expand mass_log to [BATCH, N]
+        mass_log_expanded = mass_log.unsqueeze(0).expand(batch_size, -1)
+        
+        # Scores [BATCH, N]
+        scores_matrix = sims_matrix + mass_log_expanded * LAMBDA_FACTOR
+        
+        # Penalize invalid
+        scores_matrix[~valid_mask] = -100.0
+        
+        # ========================================================================
+        # Best Match Selection
+        # ========================================================================
+        
+        # Max scores per embedding [BATCH]
+        best_scores, best_indices = torch.max(scores_matrix, dim=1)
+        
+        results = []
+        for i in range(batch_size):
+            idx = best_indices[i].item()
+            score = best_scores[i].item()
+            
+            # Check if any valid match existed (if score is -100.0, it means no valid match)
+            # Actually, because we added mass_log * LAMBDA, the score might be higher than -100
+            # even if invalid.
+            # Correct check: check if the chosen index was valid
+            is_valid = valid_mask[i, idx].item()
+            
+            if not is_valid:
+                results.append(("NEW_BUFFER", 0.0))
+            else:
+                node_id = self.ids[idx]
+                results.append((node_id, score))
+                
+        return results
